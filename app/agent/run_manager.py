@@ -28,6 +28,8 @@ DEFAULT_TOOLS = [
     "generate_images",
     "crawl_notes",
     "knowledge_search",  # 调研规划 M2: 检索工具化, 只读安全, 默认启用
+    "read_artifact",
+    "load_skill",
 ]
 ALL_TOOLS = DEFAULT_TOOLS + ["publish_to_xhs", "sync_to_feishu"]
 
@@ -36,6 +38,15 @@ logger = logging.getLogger("agent.run_manager")
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _run_model_name(backend: str) -> str:
+    if backend == "mock":
+        return "mock"
+    from app.agent.llm import openrouter_model_name
+
+    routed = openrouter_model_name()
+    return routed or settings.openai_model or backend
 
 
 def _resolve_terminal(stopped: bool, is_complete: bool) -> tuple[str, str]:
@@ -55,6 +66,10 @@ class AgentRunManager:
         self._lock = threading.RLock()
         self._approval_conditions: dict[str, threading.Condition] = {}
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent-run")
+        # Dreaming must not compete with in-flight runs for the same 4 workers.
+        self._consolidation_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="agent-dream"
+        )
         self._load_runs()
 
     def create(
@@ -80,7 +95,7 @@ class AgentRunManager:
             "tone": tone,
             "backend": backend,
             # 缺陷6: 记录实际模型名,控制台不再写死 "OpenAI"。
-            "model": "mock" if backend == "mock" else (settings.openai_model or backend),
+            "model": _run_model_name(backend),
             "enabled_tools": tools,
             "status": "queued",
             "created_at": created_at,
@@ -127,6 +142,16 @@ class AgentRunManager:
                 reverse=True,
             )[: min(max(limit, 1), 50)]
         return [self.summary(run_id) for run_id in ids]
+
+    def context_usage(self, run_id: str, limit: int = 20) -> dict[str, Any]:
+        """Latest context snapshot plus recent history. Missing data is null, not 404."""
+        run = self.get(run_id)
+        history = list(run.get("context_usage_history") or [])
+        keep = min(max(int(limit), 1), 50)
+        return {
+            "latest": run.get("context_usage_latest"),
+            "history": history[-keep:],
+        }
 
     def events_after(self, run_id: str, last_event_id: int = 0) -> list[dict[str, Any]]:
         run = self.get(run_id)
@@ -215,7 +240,7 @@ class AgentRunManager:
                             run_id, action, params
                         ),
                         checkpointer=StepCheckpointer(),
-                        consolidation_pool=self._pool,
+                        consolidation_pool=self._consolidation_pool,
                     )
                 finally:
                     # 必须在同一个 loop 内关掉 LLM 客户端: 否则 Windows proactor
@@ -292,6 +317,20 @@ class AgentRunManager:
             self._emit(run_id, "quality_evaluation", fields)
         elif kind == "approval_rejected":
             self._emit(run_id, "approval_resolved", {**fields, "approved": False})
+        elif kind == "context_usage":
+            self._emit(run_id, "context_usage", fields)
+            with self._lock:
+                run = self._require(run_id)
+                run["context_usage_latest"] = fields
+                history = run.setdefault("context_usage_history", [])
+                history.append(fields)
+                cap = max(1, int(settings.agent_context_usage_history))
+                if len(history) > cap:
+                    del history[:-cap]
+                run["updated_at"] = _now()
+                self._persist(run)
+        elif kind == "obs_compress":
+            self._emit(run_id, "obs_compress", fields)
 
     def _stop_requested(self, run_id: str) -> bool:
         with self._lock:

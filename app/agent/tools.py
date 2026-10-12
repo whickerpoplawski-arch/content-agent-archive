@@ -117,6 +117,19 @@ class CrawlParams(BaseModel):
     content_type: str = "图文"
 
 
+class ReadArtifactParams(BaseModel):
+    path: str = Field(..., description="Artifact path returned by an offloaded tool result.")
+    fields: list[str] = Field(
+        default_factory=list,
+        description="Optional object keys to return. Omit to return a truncated view of the whole artifact.",
+    )
+    limit: int = Field(20, ge=1, le=100, description="Max list items (or preview size) to return.")
+
+
+class LoadSkillParams(BaseModel):
+    name: str = Field(..., description="Skill name from the skill index (directory / frontmatter name).")
+
+
 class KnowledgeSearchParams(BaseModel):
     query: str = Field(..., description="Natural-language search query over past knowledge.")
     source: Optional[str] = Field(
@@ -343,6 +356,20 @@ async def _crawl(params: CrawlParams) -> dict:
     )).model_dump()
 
 
+async def _read_artifact(params: ReadArtifactParams) -> dict:
+    """Just-in-time read of an offloaded tool result. Paths must stay under the artifacts dir."""
+    from app.agent.artifacts import read_artifact_view
+
+    return read_artifact_view(params.path, fields=list(params.fields or []), limit=params.limit)
+
+
+async def _load_skill(params: LoadSkillParams) -> dict:
+    """Return one SKILL.md body. The planner index only carries name + description."""
+    from app.agent.skills_loader import load_skill
+
+    return load_skill(params.name)
+
+
 async def _knowledge_search(params: KnowledgeSearchParams) -> dict:
     """Agentic retrieval tool (调研规划 M2): 检索交给 Agent 决策, 而非固定注入。
 
@@ -535,5 +562,20 @@ def build_default_registry(
         "'analysis'=viral-pattern reports, 'output'=generated copy).",
         KnowledgeSearchParams,
         overrides.get("knowledge_search", _knowledge_search),
+    ))
+    registry.register(Tool(
+        "read_artifact",
+        "Read a previously offloaded tool result by artifact path. Use this when "
+        "$latest.<tool> is an artifact handle and you need specific fields. "
+        "Do not expect the full payload to be inlined into later params.",
+        ReadArtifactParams,
+        overrides.get("read_artifact", _read_artifact),
+    ))
+    registry.register(Tool(
+        "load_skill",
+        "Load the body of one skill from the skill index. Call this before planning "
+        "steps that should follow a matched skill. Returns markdown instructions only.",
+        LoadSkillParams,
+        overrides.get("load_skill", _load_skill),
     ))
     return registry

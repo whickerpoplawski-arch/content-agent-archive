@@ -81,6 +81,34 @@ class Settings(BaseSettings):
     knowledge_digest_max_docs: int = 30         # 文档数 <= 此值时全库 digest 直注入 planner
     knowledge_context_budget_chars: int = 800   # planner 知识注入字符预算（≈400 CJK token）
 
+    # Context engineering (feature-flagged). Builder defaults off so the legacy
+    # profile-string prompt stays the production path until explicitly enabled.
+    agent_context_builder_enabled: bool = False
+    agent_context_budget_planner: int = 6000
+    agent_context_hard_planner: int = 7500
+    agent_context_budget_reflector: int = 4000
+    agent_context_hard_reflector: int = 5000
+    agent_context_budget_recover: int = 2500
+    agent_context_hard_recover: int = 3000
+    agent_context_budget_consolidator: int = 3500
+    agent_context_hard_consolidator: int = 4000
+    agent_context_window_tokens: int = 128000
+    agent_context_usage_history: int = 50
+    agent_artifact_offload_enabled: bool = True
+    agent_artifact_chars: int = 8000
+    agent_artifacts_dir: str = "data/agent/artifacts"
+    agent_obs_compress_enabled: bool = False
+    agent_obs_compress_every_n: int = 12
+    agent_obs_keep_raw: int = 4
+    agent_obs_compress_chars: int = 24000
+    agent_obs_compress_ratio: float = 0.85
+    agent_skills_enabled: bool = False
+    agent_skills_dir: str = "skills"
+    agent_skill_promote_confidence: float = 0.8
+    agent_skill_promote_hits: int = 2
+    agent_skill_index_top_m: int = 3
+    agent_dream_fuzzy_jaccard: float = 0.85
+
     # 爬虫（optimization plan 12.8）：爬取默认无头；登录仍用有头窗口
     crawl_headless: bool = True
 
@@ -108,7 +136,15 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("debug", "crawl_headless", mode="before")
+    @field_validator(
+        "debug",
+        "crawl_headless",
+        "agent_context_builder_enabled",
+        "agent_artifact_offload_enabled",
+        "agent_obs_compress_enabled",
+        "agent_skills_enabled",
+        mode="before",
+    )
     @classmethod
     def _coerce_bool(cls, v):
         if isinstance(v, str):

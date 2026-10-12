@@ -153,6 +153,23 @@ CRAWL_HEADLESS=false               # 风控加强时可改 false 用有头窗口
 ```
 
 > LLM 配置优先级：环境变量 / `.env` > Codex 默认值（`~/.codex/config.toml` 的模型与 `base_url`、`~/.codex/auth.json` 的 `OPENAI_API_KEY`）。
+>
+> OpenRouter（规划 / 反思 / dreaming / `scripts/openrouter_smoke.py`）只读进程环境变量，不读 Codex、不写死密钥。未设置 `OPENROUTER_API_KEY` 时仍走上面的 Responses 后端。默认免费模型 id 是 `openrouter/free`（见 `.env.example`）。
+
+### 上下文占用面板
+
+`AGENT_CONTEXT_BUILDER_ENABLED=true` 后，每次规划/反思会按角色预算装配 prompt，并通过 SSE 事件 `context_usage` 推送 token 快照。
+
+```bash
+# 终端 A
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+# 浏览器
+# http://127.0.0.1:8000/static/context_usage.html?run_id=<控制台里的 run id>
+# 或控制台顶栏 Ctx 链接
+# 快照 REST：GET /agent/runs/<run_id>/context_usage
+```
+
+大工具结果默认外置到 `data/agent/artifacts/`（`read_artifact` 按需读回）。观察压缩与 SKILL.md 晋升默认关闭：`AGENT_OBS_COMPRESS_ENABLED`、`AGENT_SKILLS_ENABLED`。技能索引只在规划时注入 name + description，正文用 `load_skill`。Dreaming 写进的技能要到**下一次 run** 才进入 planner。
 
 ### 3. 启动服务
 

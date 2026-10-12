@@ -27,7 +27,7 @@
   <div class="brand">XHS</div>
   <header class="topbar">
     <div class="title">Agent Console <span class="run-id" id="runId">新任务</span></div>
-    <div class="top-actions"><span class="model" id="modelLabel">OpenAI</span><span class="status" id="runStatus">就绪</span><button class="icon-btn danger" id="stopRunBtn" title="停止任务" disabled>■</button><a class="icon-btn" href="/static/index.html" title="返回首页" style="text-decoration:none;color:inherit">⌂</a></div>
+    <div class="top-actions"><span class="model" id="modelLabel">OpenAI</span><a id="contextUsageLink" href="/static/context_usage.html" target="_blank" title="上下文占用" style="color:inherit;text-decoration:none;font-size:12px">Ctx</a><span class="status" id="runStatus">就绪</span><button class="icon-btn danger" id="stopRunBtn" title="停止任务" disabled>■</button><a class="icon-btn" href="/static/index.html" title="返回首页" style="text-decoration:none;color:inherit">⌂</a></div>
   </header>
 
   <nav class="toolbox" aria-label="Agent 工具箱">
@@ -78,7 +78,7 @@
 <script>
   const toolOrder=['knowledge_search','crawl_notes','analyze_notes','generate_topics','generate_contents','generate_images','publish_to_xhs','sync_to_feishu'];
   const toolNames={knowledge_search:'检索',crawl_notes:'采集',load_notes:'载入样本',analyze_notes:'分析',generate_topics:'选题',generate_contents:'生成',generate_images:'配图',publish_to_xhs:'发布',sync_to_feishu:'飞书'};
-  const eventNames={run_started:'任务开始',plan_created:'计划已生成',step_started:'步骤开始',tool_started:'工具调用开始',tool_completed:'工具调用完成',crawl_progress:'采集进度',reflection:'Agent 反思',replan:'重新规划',quality_evaluation:'质量评估',approval_required:'等待审批',approval_resolved:'审批已处理',step_failed:'步骤失败',run_stopping:'正在停止',run_stopped:'任务已停止',run_completed:'任务完成',run_failed:'任务失败'};
+  const eventNames={run_started:'任务开始',plan_created:'计划已生成',step_started:'步骤开始',tool_started:'工具调用开始',tool_completed:'工具调用完成',crawl_progress:'采集进度',reflection:'Agent 反思',replan:'重新规划',quality_evaluation:'质量评估',approval_required:'等待审批',approval_resolved:'审批已处理',step_failed:'步骤失败',run_stopping:'正在停止',run_stopped:'任务已停止',run_completed:'任务完成',run_failed:'任务失败',context_usage:'上下文占用',obs_compress:'观察压缩'};
   const state={run:null,source:null,lastEventId:0,toolEvents:{},startedAt:null};
 
   const $=id=>document.getElementById(id);
@@ -113,11 +113,12 @@
 
   function connectEvents(runId){if(state.source)state.source.close();state.source=new EventSource(`/agent/runs/${runId}/events`);Object.keys(eventNames).forEach(type=>state.source.addEventListener(type,e=>{const event=JSON.parse(e.data);applyEvent(event)}));state.source.onerror=()=>{if(state.run&&!isTerminal(state.run.status))setTimeout(()=>connectEvents(runId),1200)}}
 
-  async function createRun(event){event.preventDefault();const goal=$('goalInput').value.trim();if(!goal)return;try{$('createRunBtn').disabled=true;resetView();addMessage('user',goal);const run=await api('/agent/runs',{method:'POST',body:json({goal,audience:$('audienceInput').value.trim(),tone:$('toneInput').value.trim(),backend:'openai',enabled_tools:enabledTools()})});state.run=run;state.startedAt=Date.now();localStorage.setItem('xhs-agent-last-run',run.run_id);$('runId').textContent=`/ ${run.run_id}`;$('modelLabel').textContent=run.model||run.backend||'OpenAI';setStatus(run.status);connectEvents(run.run_id);loadHistory()}catch(error){toast(error.message)}finally{$('createRunBtn').disabled=false}}
+  function setContextLink(runId){const link=$('contextUsageLink');if(!link)return;link.href=runId?`/static/context_usage.html?run_id=${encodeURIComponent(runId)}`:'/static/context_usage.html'}
+  async function createRun(event){event.preventDefault();const goal=$('goalInput').value.trim();if(!goal)return;try{$('createRunBtn').disabled=true;resetView();addMessage('user',goal);const run=await api('/agent/runs',{method:'POST',body:json({goal,audience:$('audienceInput').value.trim(),tone:$('toneInput').value.trim(),backend:'openai',enabled_tools:enabledTools()})});state.run=run;state.startedAt=Date.now();localStorage.setItem('xhs-agent-last-run',run.run_id);$('runId').textContent=`/ ${run.run_id}`;setContextLink(run.run_id);$('modelLabel').textContent=run.model||run.backend||'OpenAI';setStatus(run.status);connectEvents(run.run_id);loadHistory()}catch(error){toast(error.message)}finally{$('createRunBtn').disabled=false}}
 
   function resetView(){if(state.source)state.source.close();state.source=null;state.lastEventId=0;resetToolStates();$('messages').innerHTML='';$('timeline').innerHTML='';$('timelineEmpty')?.remove();const empty=document.createElement('div');empty.className='timeline-empty';empty.id='timelineEmpty';empty.textContent='等待 Agent 规划任务…';$('tracePanel').prepend(empty);$('artifacts').innerHTML='<div class="timeline-empty">任务完成后显示分析、选题和文案。</div>';renderMetrics({})}
 
-  async function loadRun(runId){try{const run=await api(`/agent/runs/${runId}`);state.run=run;localStorage.setItem('xhs-agent-last-run',runId);$('runId').textContent=`/ ${runId}`;$('modelLabel').textContent=run.model||run.backend||'OpenAI';setStatus(run.status);resetToolStates();$('messages').innerHTML='';addMessage('user',run.goal);$('timeline').innerHTML='';$('timelineEmpty')?.remove();state.lastEventId=0;run.events.forEach(event=>applyEvent(event,{live:false}));renderArtifacts(run.outputs||{});renderMetrics(run);if(!isTerminal(run.status))connectEvents(runId)}catch(error){localStorage.removeItem('xhs-agent-last-run');toast(error.message)}}
+  async function loadRun(runId){try{const run=await api(`/agent/runs/${runId}`);state.run=run;localStorage.setItem('xhs-agent-last-run',runId);$('runId').textContent=`/ ${runId}`;setContextLink(runId);$('modelLabel').textContent=run.model||run.backend||'OpenAI';setStatus(run.status);resetToolStates();$('messages').innerHTML='';addMessage('user',run.goal);$('timeline').innerHTML='';$('timelineEmpty')?.remove();state.lastEventId=0;run.events.forEach(event=>applyEvent(event,{live:false}));renderArtifacts(run.outputs||{});renderMetrics(run);if(!isTerminal(run.status))connectEvents(runId)}catch(error){localStorage.removeItem('xhs-agent-last-run');toast(error.message)}}
 
   async function stopRun(){if(!state.run)return;try{const run=await api(`/agent/runs/${state.run.run_id}/stop`,{method:'POST'});setStatus(run.status)}catch(error){toast(error.message)}}
 

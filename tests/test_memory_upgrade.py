@@ -103,6 +103,14 @@ def test_recall_rejects_small_set_partial_overlap():
     assert "研究生" not in txt
 
 
+def test_topic_overlap_ignores_single_char_on_large_sets():
+    """CJK unigrams that do not form a shared bigram must not clear 0.4."""
+    from app.agent.orchestrator import _topic_overlap
+
+    assert _topic_overlap("甲乙丙丁戊己", "甲庚丙辛戊壬") == 0.0
+    assert _topic_overlap("为西电学生写文案", "西电实习分享") >= 0.4
+
+
 # ---------- 阶段4: 遗忘衰减 ----------
 
 
