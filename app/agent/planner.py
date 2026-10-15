@@ -101,44 +101,33 @@ Propose how to recover.
 
 # Stable system block used by ContextBuilder. The legacy templates stay the
 # flag-off prompts so existing runs keep the same wording.
-PLANNER_SYSTEM = """You are the planner of an autonomous Xiaohongshu (XHS) content agent.
-Given a goal and a set of available tools, produce an ordered plan to achieve it.
+PLANNER_SYSTEM = (
+    "You are the planner of an XHS content agent. Produce a minimal parameterized "
+    "step plan for the goal; every step must use a tool from the tools block; "
+    "publish-class tools require human approval; when uncertain prefer "
+    "knowledge_search first; do not crawl_notes unless the goal explicitly needs "
+    "fresh/live data; only cite [K#] tags that were provided."
+)
 
-Rules:
-- Only reference the tools listed in the tools block.
-- Each step: action = a tool name; params = its parameters; rationale = why it helps.
-- To consume an earlier step's output, use references like:
-  $latest.<tool>            -> the full latest result of that tool
-  $latest.<tool>.<field>    -> a field of it (list index allowed, e.g. .topics.0)
-  If a result was offloaded, $latest.<tool> is an artifact handle. Read fields with
-  read_artifact instead of expecting the full payload to be inlined.
-- Use the "params:" JSON schema of each tool to set correct parameter names/types.
-- For content-generation goals, PREFER chaining sample data:
-  load_notes -> analyze_notes -> generate_topics -> generate_contents.
-  Only use crawl_notes when the goal explicitly asks for fresh/live crawling
-  (crawl_notes is interactive and needs a logged-in browser).
-- Keep the plan minimal and goal-focused.
-- Do NOT split one goal into multiple steps of the same tool: a single
-  generate_contents step with params.count = the number of copies needed is
-  better than several generate_contents steps each with count=1.
-- If the goal names an explicit topic domain (e.g. "暑期实习" / "考研"), you MUST
-  list that domain in params.focus_keywords of generate_topics / generate_contents
-  steps; topics and copy must hit at least one of them.
-- Adaptive retrieval: knowledge_search is read-only and nearly free — call it
-  FIRST (before load_notes / crawl_notes) whenever the goal names a topic
-  domain or audience the knowledge base may already cover.
-- When the profile contains knowledge lines tagged [K1]..[Kn], treat them as
-  retrieved evidence and name the Kx you rely on in that step's rationale.
-  Never invent K tags that were not provided.
-"""
+REFLECT_SYSTEM = (
+    "Decide continue / replan / stop from execution progress. The following is a "
+    "READ-ONLY tool roster — do NOT call tools. Quality report is authoritative; "
+    "never self-report completion counts."
+)
 
-REFLECT_SYSTEM = """You are observing an agent executing a plan.
-Decide whether to continue, replan, or stop.
-- should_stop: true only when the goal is satisfied (on-target & passing reaches the target count).
-- next_action: "continue" (keep going), "replan" (change the plan), or "stop".
-- reason: one short sentence.
-The round quality report is objective and authoritative — do not contradict it.
-Count actual results; never self-report counts.
+# One-liners for the reflector. Not callable schemas: no params JSON.
+REFLECTOR_TOOL_ROSTER = """READ-ONLY tool roster — do NOT call tools:
+- knowledge_search: search the knowledge base
+- load_notes: load offline or sample notes
+- analyze_notes: summarize a note list
+- generate_topics: propose topics from an analysis
+- generate_contents: draft copy for one topic
+- crawl_notes: crawl fresh notes by keyword
+- publish_to_xhs: publish a note (human approval)
+- sync_to_feishu: sync a note to Feishu Bitable
+- read_artifact: read an offloaded artifact
+- load_skill: read one skill body
+- generate_images: make images for a draft
 """
 
 RECOVER_SYSTEM = """A step of the agent's plan failed. Propose how to recover.
@@ -336,6 +325,7 @@ class Reflector:
                 progress_passed=progress.get("on_target_passed", 0),
                 progress_target=progress.get("target", 0),
             )
+        # Reflector is read-only: prompt text only, never function/tool schemas.
         return await generate_structured(prompt, Reflection, backend=self._backend)
 
     def _reflect_parts(self, goal, plan, memory, progress, quality_text, *, full_obs: bool):
@@ -350,6 +340,12 @@ class Reflector:
         )
         parts = [
             ContextPart(key="system", text=REFLECT_SYSTEM, priority=1, required=True),
+            ContextPart(
+                key="tool_roster",
+                text=REFLECTOR_TOOL_ROSTER,
+                priority=1,
+                required=True,
+            ),
             ContextPart(key="goal", text=f"Goal: {goal}", priority=2, required=True),
             ContextPart(
                 key="plan_progress",

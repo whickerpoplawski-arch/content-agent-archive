@@ -25,6 +25,7 @@ _BUCKETS = {
     "system": "system",
     "tools": "tools",
     "tools_schema": "tools",
+    "tool_roster": "tools",
     "goal": "messages",
     "plan_progress": "messages",
     "current_plan_progress": "messages",

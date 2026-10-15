@@ -234,7 +234,7 @@ def test_default_registry_has_knowledge_search():
     assert "knowledge_search" in registry.names()
     spec = registry.get("knowledge_search").spec()
     assert "source" in spec.params_schema_json
-    assert "crawl" in registry.get("knowledge_search").description
+    assert "source" in registry.get("knowledge_search").description
 
 
 def test_knowledge_search_tool_returns_hits(store):

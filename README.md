@@ -171,7 +171,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 选中或正在运行的任务会在控制台底栏显示上下文占用圆环（例如 `2%`）。点击展开浮层：分段条加上系统提示词 / 工具定义 / 对话消息，以及有 token 时的技能、知识、语义记忆、经历记忆。数字来自同一条 SSE `context_usage`，并在加载任务时用 `GET /agent/runs/{id}/context_usage` 补齐，不必离开控制台。点空白处或按 Esc 关闭浮层。完整页 `context_usage.html` 仍然保留。
 
-离线试用：服务带上 `AGENT_CONTEXT_BUILDER_ENABLED=true` 后，用 mock 后端建一次任务，再打开控制台并点百分比芯片。
+离线试用：服务带上 `AGENT_CONTEXT_BUILDER_ENABLED=true` 后，用 mock 后端建一次任务，再打开控制台并点百分比芯片。浮层里的 `planner · tools N` 芯片应显示 tools 远大于 0（完整参数 schema）。反思是只读名单，tools 桶没有 schema；巩固（consolidator）的 tools 为 0。
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/agent/runs \

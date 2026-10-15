@@ -546,35 +546,69 @@ def build_default_registry(
     (e.g. stubs for image/publish) to keep offline demos and tests hermetic."""
     overrides = tool_overrides or {}
     registry = ToolRegistry()
-    registry.register(Tool("load_notes", "Load note items (sample or injected).", LoadNotesParams, overrides.get("load_notes", _load_notes)))
-    registry.register(Tool("analyze_notes", "Analyze a list of notes into keywords/tags/insights.", AnalyzeParams, overrides.get("analyze_notes", _analyze)))
-    registry.register(Tool("generate_topics", "Generate topic suggestions from an analysis.", TopicsParams, overrides.get("generate_topics", _topics)))
-    registry.register(Tool("generate_contents", "Generate XHS copy drafts for a topic.", ContentsParams, overrides.get("generate_contents", _contents)))
-    registry.register(Tool("generate_images", "Generate matching images for a draft.", ImagesParams, overrides.get("generate_images", _images)))
-    registry.register(Tool("publish_to_xhs", "Generate images and publish a note to Xiaohongshu.", PublishParams, overrides.get("publish_to_xhs", _publish)))
-    registry.register(Tool("sync_to_feishu", "Sync a generated note into a Feishu Bitable.", FeishuParams, overrides.get("sync_to_feishu", _feishu)))
-    registry.register(Tool("crawl_notes", "Crawl Xiaohongshu notes by keywords.", CrawlParams, overrides.get("crawl_notes", _crawl)))
+    registry.register(Tool(
+        "load_notes",
+        "Offline/sample notes; use crawl for fresh data.",
+        LoadNotesParams,
+        overrides.get("load_notes", _load_notes),
+    ))
+    registry.register(Tool(
+        "analyze_notes",
+        "Stats and insights from a note list only.",
+        AnalyzeParams,
+        overrides.get("analyze_notes", _analyze),
+    ))
+    registry.register(Tool(
+        "generate_topics",
+        "From an analysis; put the domain in focus_keywords.",
+        TopicsParams,
+        overrides.get("generate_topics", _topics),
+    ))
+    registry.register(Tool(
+        "generate_contents",
+        "Drafts for a topic; use count for N copies, don't split the same tool into N steps.",
+        ContentsParams,
+        overrides.get("generate_contents", _contents),
+    ))
+    registry.register(Tool(
+        "generate_images",
+        "Images for an existing draft.",
+        ImagesParams,
+        overrides.get("generate_images", _images),
+    ))
+    registry.register(Tool(
+        "publish_to_xhs",
+        'Side effect, approval required; never "just try".',
+        PublishParams,
+        overrides.get("publish_to_xhs", _publish),
+    ))
+    registry.register(Tool(
+        "sync_to_feishu",
+        "Side effect: sync a generated note to Feishu Bitable.",
+        FeishuParams,
+        overrides.get("sync_to_feishu", _feishu),
+    ))
+    registry.register(Tool(
+        "crawl_notes",
+        "Keyword crawl; needs a logged-in browser; only if the goal asks for fresh content.",
+        CrawlParams,
+        overrides.get("crawl_notes", _crawl),
+    ))
     registry.register(Tool(
         "knowledge_search",
-        "Search past knowledge (crawled notes / viral-pattern analyses / previously "
-        "generated copy). Use BEFORE deciding to crawl for research, comparison or "
-        "trend goals; route by intent via source ('crawl'=raw competitor notes, "
-        "'analysis'=viral-pattern reports, 'output'=generated copy).",
+        "Use first when topic/audience may be in KB; route via source; do not write copy with it.",
         KnowledgeSearchParams,
         overrides.get("knowledge_search", _knowledge_search),
     ))
     registry.register(Tool(
         "read_artifact",
-        "Read a previously offloaded tool result by artifact path. Use this when "
-        "$latest.<tool> is an artifact handle and you need specific fields. "
-        "Do not expect the full payload to be inlined into later params.",
+        "Read offloaded $latest fields by path.",
         ReadArtifactParams,
         overrides.get("read_artifact", _read_artifact),
     ))
     registry.register(Tool(
         "load_skill",
-        "Load the body of one skill from the skill index. Call this before planning "
-        "steps that should follow a matched skill. Returns markdown instructions only.",
+        "Load the skill body after an index match, then plan by it.",
         LoadSkillParams,
         overrides.get("load_skill", _load_skill),
     ))
