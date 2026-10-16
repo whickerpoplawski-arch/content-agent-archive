@@ -133,6 +133,9 @@ class XHSAgent:
             if saved:
                 plan = Plan.model_validate(saved["plan"])
                 memory.restore(saved.get("memory", {}).get("steps", []))
+                saved_meta = saved.get("memory", {}).get("meta")
+                if isinstance(saved_meta, dict):
+                    memory.meta = saved_meta
                 base_usage = saved.get("usage") or {}
                 tracer.event(
                     "resume_from_checkpoint",
@@ -143,10 +146,31 @@ class XHSAgent:
                 )
                 resumed = True
         if not resumed:
-            knowledge_text = _knowledge_context(goal)
+            profile_text = _profile_text(profile, goal)
+            if settings.agent_context_builder_enabled:
+                from app.agent.context_parts import build_planner_parts
+                from app.agent.planner import PLANNER_SYSTEM
+
+                parts = build_planner_parts(
+                    profile,
+                    goal,
+                    tools_full=self.planner._tools_text(),
+                    tools_concise=self.planner._tools_concise(),
+                    system_text=PLANNER_SYSTEM,
+                )
+                knowledge_text = next((p.text for p in parts if p.key == "knowledge"), "")
+                plan = await self.planner.plan(
+                    goal,
+                    profile_text,
+                    context_parts=parts,
+                    tracer=tracer,
+                    run_id=tracer.run_id,
+                )
+            else:
+                knowledge_text = _knowledge_context(goal)
+                plan = await self.planner.plan(goal, profile_text + knowledge_text)
             if knowledge_text:
                 tracer.event("knowledge_context", chars=len(knowledge_text))
-            plan = await self.planner.plan(goal, _profile_text(profile, goal) + knowledge_text)
             # M2 结构化强制(Read-Gate 闭环): prompt 措辞对抗已证不可靠(两轮实战
             # knowledge_search 零调用), 改为确定性注入——调用级(链首插检索步)
             # + 消费级(生成步骤 params.knowledge_hints)。mock 后端跳过, 保持
@@ -157,6 +181,7 @@ class XHSAgent:
                     tracer.event("knowledge_injected", **injected)
             tracer.event("plan", steps=[s.action for s in plan.steps])
         executor.base_usage = base_usage
+        executor.profile_dict = profile
         plan = await executor.execute(goal, _profile_text(profile, goal), plan, memory)
 
         if plan.is_complete and checkpointer:
@@ -187,7 +212,7 @@ class XHSAgent:
             # 巩固在别的线程+loop 跑, 不能共享主 run 的 openai 客户端(跨 loop 复用
             # 连接 + 主 run 结束即 aclose 会打断它): 真实后端时给它一份全新的。
             consol_backend = self.backend
-            if getattr(self.backend, "name", "") == "openai":
+            if getattr(self.backend, "name", "") in ("openai", "openrouter"):
                 consol_backend = get_backend()
             submit_consolidation(
                 consolidation_pool,
@@ -196,10 +221,16 @@ class XHSAgent:
                 goal,
                 succeeded_actions,
                 outputs,
+                tracer=tracer,
             )
         else:
             await consolidate_quietly(
-                self.backend, memory.long_term, goal, succeeded_actions, outputs
+                self.backend,
+                memory.long_term,
+                goal,
+                succeeded_actions,
+                outputs,
+                tracer=tracer,
             )
         # 阶段2: run 尾自动抽取用户事实(一次 LLM 调用,失败不致命)。
         _store_user_facts(
@@ -306,6 +337,55 @@ def _knowledge_retrieval_text(store, variants: list[str], top_k: int) -> str:
             break
         lines.append(line)
         used += len(line)
+    return "\n" + "\n".join(lines)
+
+
+def knowledge_for_tokens(goal: str, max_tokens: int) -> str:
+    """Knowledge block sized to the tokens still left in the planner budget.
+
+    The legacy ``_knowledge_context`` char budget is unchanged. This path is
+    only used when ContextBuilder is assembling a planner prompt.
+    """
+    if max_tokens < 40:
+        return ""
+    try:
+        from app.agent.context_builder import count_tokens
+        from app.agent.knowledge import get_knowledge_store
+
+        store = get_knowledge_store()
+        if store.count() <= settings.knowledge_digest_max_docs:
+            header = "Knowledge base digest (cite as K1..Kn when used):"
+            docs = list(store.list_documents())
+            rows = []
+            for index, doc in enumerate(docs, start=1):
+                rows.append(
+                    f"- [K{index}|{doc.get('source')}] {doc.get('title', '')}: "
+                    f"{doc.get('snippet', '')}"
+                )
+        else:
+            header = "Relevant knowledge from past runs (cite as K1..Kn when used):"
+            hits = store.search_multi(_query_variants(goal), top_k=8)
+            rows = []
+            for index, hit in enumerate(hits, start=1):
+                rows.append(
+                    f"- [K{index}|{hit.get('source')}] {hit.get('title', '')}: "
+                    f"{str(hit.get('text', ''))[:220]}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("knowledge context skipped (non-fatal): %s", exc)
+        return ""
+    if not rows:
+        return ""
+    lines = [header]
+    used = count_tokens(header)
+    for row in rows:
+        cost = count_tokens(row)
+        if used + cost > max_tokens and len(lines) > 1:
+            break
+        lines.append(row)
+        used += cost
+    if len(lines) == 1:
+        return ""
     return "\n" + "\n".join(lines)
 
 
@@ -439,12 +519,14 @@ def _remember_lesson(memory: AgentMemory, goal: str, plan: Plan, outputs: dict) 
     memory.long_term.set_many(writes)
 
 
-def _profile_text(profile: dict[str, Any], goal: str = "") -> str:
+def _profile_sections(profile: dict[str, Any], goal: str = "") -> dict[str, str]:
+    """Named blocks joined by ``_profile_text`` (legacy order preserved)."""
     if not profile:
-        return "(no profile yet - ask for or infer the target user)"
-    parts = []
-    for k, v in profile.items():
-        if k in (
+        return {"_empty": "(no profile yet - ask for or infer the target user)"}
+    sections: dict[str, str] = {}
+    kv = []
+    for key, value in profile.items():
+        if key in (
             "lessons",
             "episodic",
             "procedural",
@@ -454,19 +536,20 @@ def _profile_text(profile: dict[str, Any], goal: str = "") -> str:
             "procedural_insights",
         ):
             continue
-        parts.append(f"{k}: {v}")
+        kv.append(f"{key}: {value}")
+    if kv:
+        sections["kv"] = "\n".join(kv)
 
     pref_text = _preferences_text(profile)
     if pref_text:
-        parts.append(pref_text)
+        sections["prefs"] = pref_text
     facts_text = _facts_text(profile)
     if facts_text:
-        parts.append(facts_text)
+        sections["facts"] = facts_text
 
-    # 阶三(dreaming): 后台巩固产出的可迁移洞察注入规划 prompt。
     insights_text = _insights_text(profile)
     if insights_text:
-        parts.append(insights_text)
+        sections["insights"] = insights_text
 
     episodic = profile.get("episodic") or profile.get("lessons") or []
     recalled = _profile_recall(goal, episodic)
@@ -481,23 +564,34 @@ def _profile_text(profile: dict[str, Any], goal: str = "") -> str:
                 f"- goal='{lesson.get('goal','')}' ok={lesson.get('steps_ok')} "
                 f"results={lesson.get('results')}{hs}{qs}"
             )
-        parts.append("\n".join(lines))
+        sections["episodic"] = "\n".join(lines)
 
     procedural = profile.get("procedural") or []
     if procedural:
         rel_proc = [
-            p
-            for p in procedural
-            if not goal or _topic_overlap(goal, p.get("goal", "")) >= RECALL_MIN_SCORE
+            item
+            for item in procedural
+            if not goal or _topic_overlap(goal, item.get("goal", "")) >= RECALL_MIN_SCORE
         ]
         if rel_proc:
             plines = ["Successful tool chains to follow:"]
-            for p in rel_proc[-3:]:
+            for item in rel_proc[-3:]:
                 plines.append(
-                    f"- goal='{p.get('goal','')}' steps={p.get('actions', [])}"
+                    f"- goal='{item.get('goal','')}' steps={item.get('actions', [])}"
                 )
-            parts.append("\n".join(plines))
+            sections["procedural"] = "\n".join(plines)
+    return sections
 
+
+def _profile_text(profile: dict[str, Any], goal: str = "") -> str:
+    sections = _profile_sections(profile, goal)
+    if not profile:
+        return sections.get("_empty", "(no profile yet - ask for or infer the target user)")
+    parts = [
+        sections[key]
+        for key in ("kv", "prefs", "facts", "insights", "episodic", "procedural")
+        if sections.get(key)
+    ]
     return "\n".join(parts) or "(no profile yet - ask for or infer the target user)"
 
 
@@ -506,11 +600,16 @@ def _goal_signature(goal: str) -> str:
 
 
 def _tokens(text: str) -> set[str]:
-    """\u53ec\u56de/\u53bb\u91cd token \u96c6:ASCII \u5355\u8bcd + \u5355\u4e2a CJK \u5b57\u7b26\u3002"""
+    """召回 token：ASCII 词 + CJK 双字。单字不再单独计分，避免大集合单字虚高。"""
     text = (text or "").lower()
-    words = re.findall(r"[a-z0-9]+", text)
-    cjk = re.findall(r"[\u4e00-\u9fff]", text)
-    return set(words) | set(cjk)
+    words = set(re.findall(r"[a-z0-9]+", text))
+    grams: set[str] = set()
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(run) == 1:
+            grams.add(run)
+        else:
+            grams.update(run[i : i + 2] for i in range(len(run) - 1))
+    return words | grams
 
 
 def _strip_generic(goal: str) -> str:
@@ -524,18 +623,25 @@ def _strip_generic(goal: str) -> str:
 
 
 def _topic_overlap(a: str, b: str) -> float:
-    """overlap coefficient |A\u2229B| / min(|A|,|B|):\u63aa\u8f9e\u5f02\u4f46\u540c\u4e3b\u9898 -> \u9ad8\u76f8\u5173\u3002
+    """overlap coefficient |A∩B| / min(|A|,|B|) on bigram tokens.
 
-    \u57fa\u4e8e\u53bb\u901a\u7528\u8bcd\u540e\u7684 token \u96c6,\u907f\u514d \u4e3a/\u751f\u6210/\u6587\u6848 \u8fd9\u7c7b\u5171\u4eab\u5b57\u865a\u9ad8\u76f8\u5173\u5ea6\u3002
-
-    \u9636\u6bb53b+: \u5c0f\u96c6\u5408\u81ea\u9002\u5e94\u2014\u2014min(|A|,|B|)<=2 \u65f6\u5355\u5b57\u4ea4\u96c6\u65b9\u5dee\u5927(\u5982
-    \u5973\u751f vs \u7814\u7a76\u751f\u4ec5\u5171\u4eab"\u751f"\u5374\u62ff\u5230 0.5),\u8981\u6c42\u5b8c\u5168\u8986\u76d6\u624d\u7b97\u76f8\u5173;
-    \u96c6\u5408\u8db3\u591f\u5927\u65f6\u7ef4\u6301 0.4 \u9608\u503c\u3002
+    去通用词后计分，避免「为/生成/文案」虚高。CJK 用双字而不是单字：
+    大集合只共享「生」「教」这类单字时不再越过 0.4。小集合（<=2 个 token）
+    仍要求完全覆盖，保住「女生 ≠ 研究生」。
     """
     sa, sb = _tokens(_strip_generic(a)), _tokens(_strip_generic(b))
     if not sa or not sb:
         return 0.0
-    overlap = len(sa & sb) / min(len(sa), len(sb))
+    inter = sa & sb
+    # Lone CJK characters are not evidence unless the smaller side is covered
+    # entirely by them (a 1-character topic). Shared bigrams/words count.
+    strong = {token for token in inter if len(token) >= 2 or token.isascii()}
+    if not strong:
+        smaller = sa if len(sa) <= len(sb) else sb
+        if smaller and smaller <= inter and min(len(sa), len(sb)) <= 2:
+            return 1.0
+        return 0.0
+    overlap = len(strong) / min(len(sa), len(sb))
     if min(len(sa), len(sb)) <= 2:
         return overlap if overlap >= 1.0 else 0.0
     return overlap
@@ -786,9 +892,11 @@ def _collect_outputs(
     12.3: dedupe by title and rank by relevance to the goal domain so cross-round
     accumulation no longer mixes in off-topic / duplicated drafts.
     """
+    from app.agent.artifacts import materialize_result
+
     outputs: dict[str, Any] = {}
 
-    analysis = memory.latest("analyze_notes")
+    analysis = materialize_result(memory.latest("analyze_notes"))
     if analysis:
         outputs["analysis_summary"] = analysis.get("summary", "")
         outputs["top_keywords"] = analysis.get("top_keywords", [])
@@ -796,7 +904,7 @@ def _collect_outputs(
         outputs["title_patterns"] = analysis.get("title_patterns", [])
         outputs["insight_points"] = analysis.get("insight_points", [])
 
-    contents = memory.results_for("generate_contents")
+    contents = [materialize_result(item) for item in memory.results_for("generate_contents")]
     if contents:
         results: list[dict[str, Any]] = []
         quality_reports: list[dict[str, Any]] = []
@@ -820,7 +928,7 @@ def _collect_outputs(
         if quality_reports:
             outputs["quality_report"] = quality_reports
 
-    published = memory.results_for("publish_to_xhs")
+    published = [materialize_result(item) for item in memory.results_for("publish_to_xhs")]
     if published:
         outputs["publish_results"] = published
 

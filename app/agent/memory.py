@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from app.core.config import settings
+
 logger = logging.getLogger("agent.memory")
 
 MEMORY_DIR = Path("data") / "agent"
@@ -73,6 +75,7 @@ class AgentMemory:
         self.long_term = long_term or LongTermMemory()
         self.steps: list[dict[str, Any]] = []  # {action, params, result, status}
         self._by_action: dict[str, list[dict[str, Any]]] = {}
+        self.meta: dict[str, Any] = {}
 
     def record(self, action: str, params: dict[str, Any], result: Any, status: str) -> None:
         entry = {"action": action, "params": params, "result": result, "status": status}
@@ -89,8 +92,11 @@ class AgentMemory:
     def count_results(self, action: str, predicate=None) -> int:
         """Count generated items across all rounds of ``action`` (12.5 objective
         progress). ``predicate`` filters items (e.g. on-target & passing)."""
+        from app.agent.artifacts import materialize_result
+
         n = 0
         for result in self.results_for(action):
+            result = materialize_result(result)
             if isinstance(result, dict):
                 for item in result.get("contents", []):
                     if predicate is None or predicate(item):
@@ -103,14 +109,36 @@ class AgentMemory:
         self._by_action = {}
         for entry in self.steps:
             self._by_action.setdefault(entry.get("action"), []).append(entry)
-    def observations(self, limit: int = 5) -> str:
-        """Compact summary of recent step observations for the planner/reflector."""
-        recent = self.steps[-limit:]
+    def observations(self, limit: int = 5, *, full: bool = False) -> str:
+        """Compact summary of recent step observations for the planner/reflector.
+
+        With observation compression enabled and a digest present, returns the
+        digest plus the last ``agent_obs_keep_raw`` raw steps. ``full=True``
+        expands every step (used to measure the pre-compression prompt). The
+        default path (flag off) stays the recent ``limit`` steps.
+        """
+        digest = None
+        if settings.agent_obs_compress_enabled:
+            digest = (self.meta or {}).get("obs_digest")
+        if digest:
+            from app.agent.compress import format_obs_digest
+
+            keep = max(1, int(settings.agent_obs_keep_raw))
+            recent = self._format_steps(self.steps[-keep:])
+            text = format_obs_digest(digest)
+            if recent:
+                text += "\nRecent steps:\n" + recent
+            return text
+        use_limit = len(self.steps) if full else limit
+        recent = self.steps[-use_limit:] if use_limit else []
+        return self._format_steps(recent) or "(no observations yet)"
+
+    def _format_steps(self, entries: list[dict[str, Any]]) -> str:
         lines = []
-        for e in recent:
-            summary = _summarize(e["result"])
-            lines.append(f"- {e['action']} -> {e['status']}: {summary}")
-        return "\n".join(lines) if lines else "(no observations yet)"
+        for entry in entries:
+            summary = _summarize(entry["result"])
+            lines.append(f"- {entry['action']} -> {entry['status']}: {summary}")
+        return "\n".join(lines)
 
 
 def _summarize(value: Any, max_len: int = 120) -> str:

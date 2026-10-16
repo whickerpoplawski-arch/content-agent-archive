@@ -10,6 +10,7 @@ stay sequential. Replan/stop decisions are surfaced to the outer loop.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -43,7 +44,7 @@ async def resolve_params(params: dict[str, Any], memory: AgentMemory) -> dict[st
 
     async def _resolve(value: Any) -> Any:
         if isinstance(value, str) and value.startswith("$"):
-            return _resolve_ref(value, memory)
+            return await _resolve_ref(value, memory)
         if isinstance(value, dict):
             return {k: await _resolve(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -53,13 +54,36 @@ async def resolve_params(params: dict[str, Any], memory: AgentMemory) -> dict[st
     return {k: await _resolve(v) for k, v in params.items()}
 
 
-def _resolve_ref(ref: str, memory: AgentMemory) -> Any:
+async def _resolve_ref(ref: str, memory: AgentMemory) -> Any:
+    """Resolve ``$latest.<tool>``.
+
+    Artifact handles are returned as-is when the reference has no field path, so
+    a multi-megabyte payload is not copied into the next tool's params. A field
+    path loads the artifact and returns that field, unless the field itself is
+    still larger than ``agent_artifact_chars`` — then the handle is returned
+    with ``refused_expand`` set. Call ``read_artifact`` for an explicit read.
+    """
+    from app.agent.artifacts import is_artifact_handle, load_artifact, serialized_len
+    from app.core.config import settings
+
     parts = ref.lstrip("$").split(".")
     if not parts or parts[0] != "latest" or len(parts) < 2:
         raise KeyError(f"Invalid reference: {ref}")
     result = memory.latest(parts[1])
     if result is None:
         raise KeyError(f"No result yet for tool '{parts[1]}' (ref {ref})")
+    if is_artifact_handle(result):
+        if len(parts) <= 2:
+            return result
+        loaded = await asyncio.to_thread(load_artifact, result["artifact"])
+        dug = _best_effort_dig(loaded, parts[2:])
+        if serialized_len(dug) > int(settings.agent_artifact_chars):
+            return {
+                **result,
+                "refused_expand": True,
+                "path": ".".join(parts[2:]),
+            }
+        return dug
     return _best_effort_dig(result, parts[2:])
 
 
@@ -92,6 +116,21 @@ def _summarize(value: Any, max_len: int = 120) -> str:
     if len(text) > max_len:
         return text[:max_len] + "..."
     return text
+
+
+def _call_kwargs(fn, candidates: dict) -> dict:
+    """Pass new optional kwargs only when the callable accepts them.
+
+    Tests and older stubs override planner.replan / reflector.judge with the
+    original signature. Unknown keywords must not break that path.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return candidates
+    return {key: value for key, value in candidates.items() if key in params}
 
 
 def _deps(step: PlanStep) -> set[str]:
@@ -132,9 +171,14 @@ def _publish_text(params: dict[str, Any]) -> str:
 
 
 def _latest_quality_report(memory: AgentMemory) -> Any:
-    latest = memory.latest("generate_contents")
+    from app.agent.artifacts import materialize_result
+
+    latest = materialize_result(memory.latest("generate_contents"))
     if isinstance(latest, dict):
         return latest.get("quality_report")
+    stored = memory.latest("generate_contents")
+    if isinstance(stored, dict):
+        return stored.get("quality_report")
     return None
 
 
@@ -144,9 +188,14 @@ def _quality_passed_count(memory: AgentMemory) -> Optional[int]:
 
     反思器不得自行估数 —— 质量门报告(逐轮 evaluated/passed)才是客观事实。
     """
+    from app.agent.artifacts import materialize_result
+
     total = 0
     any_report = False
-    for result in memory.results_for("generate_contents"):
+    for stored in memory.results_for("generate_contents"):
+        result = materialize_result(stored)
+        if not isinstance(result, dict) and isinstance(stored, dict):
+            result = stored
         if not isinstance(result, dict):
             continue
         report = result.get("quality_report")
@@ -244,7 +293,18 @@ class Executor:
                     s.action for s in plan.steps if s.status == StepStatus.FAILED
                 ]
                 new_plan = await self.planner.replan(
-                    goal, profile, plan.failed_step, focus_keywords=self._force_focus
+                    goal,
+                    profile,
+                    plan.failed_step,
+                    focus_keywords=self._force_focus,
+                    **_call_kwargs(
+                        self.planner.replan,
+                        {
+                            "context_parts": self._replan_parts(goal, profile),
+                            "tracer": self.tracer,
+                            "run_id": getattr(self.tracer, "run_id", "") or "",
+                        },
+                    ),
                 )
                 # P1-4: replan 硬校验。存在 FAILED 步骤时,新计划必须包含对失败
                 # 动作的恢复步骤(同 action),否则拒绝 replan 直接 stop —— 防止
@@ -315,7 +375,11 @@ class Executor:
                 self.tracer.event("usage", usage=usage)
             if self.checkpointer and self.tracer:
                 self.checkpointer.save(
-                    self.tracer.run_id, plan, memory.steps, usage
+                    self.tracer.run_id,
+                    plan,
+                    memory.steps,
+                    usage,
+                    memory_meta=memory.meta,
                 )
                 self.tracer.flush()
 
@@ -348,6 +412,30 @@ class Executor:
                 )
 
         return plan
+
+    def _replan_parts(self, goal: str, profile: str):
+        """Rich context parts for replan when the builder flag is on.
+
+        The failure note itself is appended by Planner.replan so this helper
+        only rebuilds the durable profile/skill/knowledge blocks.
+        """
+        from app.core.config import settings
+
+        if not settings.agent_context_builder_enabled:
+            return None
+        profile_dict = getattr(self, "profile_dict", None)
+        if not isinstance(profile_dict, dict):
+            return None
+        from app.agent.context_parts import build_planner_parts
+        from app.agent.planner import PLANNER_SYSTEM
+
+        return build_planner_parts(
+            profile_dict,
+            goal,
+            tools_full=self.planner._tools_text(),
+            tools_concise=self.planner._tools_concise(),
+            system_text=PLANNER_SYSTEM,
+        )
 
     def _combined_usage(self) -> dict[str, Any]:
         current = self.get_usage() if self.get_usage else {}
@@ -473,7 +561,15 @@ class Executor:
                 # 记录,反思器才有权威实测数据可消费(此前 record 在前,memory 里的
                 # 结果缺质量报告,导致反思只能靠 LLM 数数而振荡)。
                 result = await self._refine_contents(result, step)
-            memory.record(step.action, step.params, result, "succeeded")
+            from app.agent.artifacts import maybe_offload
+
+            stored = maybe_offload(
+                getattr(self.tracer, "run_id", None) or "adhoc",
+                len(memory.steps),
+                step.action,
+                result,
+            )
+            memory.record(step.action, step.params, stored, "succeeded")
             if self.tracer:
                 self.tracer.tool_call(step.action, True, _elapsed, step.summary)
             if step.action == "crawl_notes":
@@ -515,7 +611,18 @@ class Executor:
                 hint = f" [工具 {step.action} 可用参数]: {supported}"
             except Exception:  # noqa: BLE001
                 hint = ""
-            recovery = await self.reflector.recover(goal, step, str(exc) + hint)
+            recovery = await self.reflector.recover(
+                goal,
+                step,
+                str(exc) + hint,
+                **_call_kwargs(
+                    self.reflector.recover,
+                    {
+                        "tracer": self.tracer,
+                        "run_id": getattr(self.tracer, "run_id", "") or "",
+                    },
+                ),
+            )
             if recovery.next_action == "retry":
                 retries[index] += 1
                 if retries[index] > self.max_retries_per_step:
@@ -548,6 +655,13 @@ class Executor:
                 goal, plan, memory,
                 progress=progress,
                 quality_report=_latest_quality_report(memory),
+                **_call_kwargs(
+                    self.reflector.judge,
+                    {
+                        "tracer": self.tracer,
+                        "run_id": getattr(self.tracer, "run_id", "") or "",
+                    },
+                ),
             )
             if self.tracer:
                 self.tracer.event(

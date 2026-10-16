@@ -33,12 +33,13 @@ class StepCheckpointer:
         plan,
         memory_steps: list[dict[str, Any]],
         usage: dict[str, Any],
+        memory_meta: Optional[dict[str, Any]] = None,
     ) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         payload = {
             "run_id": run_id,
             "plan": plan.model_dump(mode="json"),
-            "memory": {"steps": memory_steps},
+            "memory": {"steps": memory_steps, "meta": memory_meta or {}},
             "usage": usage,
             "updated_at": _now(),
         }

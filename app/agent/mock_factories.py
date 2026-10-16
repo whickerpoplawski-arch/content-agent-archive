@@ -6,7 +6,7 @@ and no external services. Used by tests and the CLI demo.
 from __future__ import annotations
 
 from app.agent.llm import MockLLMBackend
-from app.agent.consolidation import ProceduralInsight
+from app.agent.consolidation import DreamOp, DreamResult, ProceduralInsight
 from app.agent.schemas import (
     Plan,
     PlanStep,
@@ -142,6 +142,21 @@ def build_mock_backend() -> MockLLMBackend:
             title="样本数据链路直出即可",
             insight="离线样本数据质量稳定时，load_notes 后可直接生成，无需爬取。",
             applies_to=["离线", "演示"],
+        ),
+    )
+    backend.register(
+        DreamResult,
+        lambda: DreamResult(
+            ops=[
+                DreamOp(
+                    op="ADD",
+                    title="样本数据链路直出即可",
+                    insight="离线样本数据质量稳定时，load_notes 后可直接生成，无需爬取。",
+                    applies_to=["离线", "演示"],
+                    confidence=0.55,
+                    when_to_use="目标是演示、离线或样本数据，且不需要新鲜爬取时。",
+                )
+            ]
         ),
     )
     return backend

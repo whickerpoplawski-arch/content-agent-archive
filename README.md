@@ -153,6 +153,34 @@ CRAWL_HEADLESS=false               # 风控加强时可改 false 用有头窗口
 ```
 
 > LLM 配置优先级：环境变量 / `.env` > Codex 默认值（`~/.codex/config.toml` 的模型与 `base_url`、`~/.codex/auth.json` 的 `OPENAI_API_KEY`）。
+>
+> OpenRouter（规划 / 反思 / dreaming / `scripts/openrouter_smoke.py`）只读进程环境变量，不读 Codex、不写死密钥。未设置 `OPENROUTER_API_KEY` 时仍走上面的 Responses 后端。默认免费模型 id 是 `openrouter/free`（见 `.env.example`）。
+
+### 上下文占用面板
+
+`AGENT_CONTEXT_BUILDER_ENABLED=true` 后，每次规划/反思会按角色预算装配 prompt，并通过 SSE 事件 `context_usage` 推送 token 快照。
+
+```bash
+# 终端 A
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+# 浏览器
+# http://127.0.0.1:8000/static/context_usage.html?run_id=<控制台里的 run id>
+# 或控制台顶栏 Ctx 链接
+# 快照 REST：GET /agent/runs/<run_id>/context_usage
+```
+
+选中或正在运行的任务会在控制台底栏显示上下文占用圆环（例如 `2%`）。点击展开浮层：分段条加上系统提示词 / 工具定义 / 对话消息，以及有 token 时的技能、知识、语义记忆、经历记忆。数字来自同一条 SSE `context_usage`，并在加载任务时用 `GET /agent/runs/{id}/context_usage` 补齐，不必离开控制台。点空白处或按 Esc 关闭浮层。完整页 `context_usage.html` 仍然保留。
+
+离线试用：服务带上 `AGENT_CONTEXT_BUILDER_ENABLED=true` 后，用 mock 后端建一次任务，再打开控制台并点百分比芯片。浮层里的 `planner · tools N` 芯片应显示 tools 远大于 0（完整参数 schema）。反思是只读名单，tools 桶没有 schema；巩固（consolidator）的 tools 为 0。
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/agent/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"goal":"离线演示上下文占用","backend":"mock","enabled_tools":["load_notes"]}'
+# 浏览器打开 http://127.0.0.1:8000/static/agent_console.html?run_id=<返回的 run_id>
+```
+
+大工具结果默认外置到 `data/agent/artifacts/`（`read_artifact` 按需读回）。观察压缩与 SKILL.md 晋升默认关闭：`AGENT_OBS_COMPRESS_ENABLED`、`AGENT_SKILLS_ENABLED`。技能索引只在规划时注入 name + description，正文用 `load_skill`。Dreaming 写进的技能要到**下一次 run** 才进入 planner。
 
 ### 3. 启动服务
 

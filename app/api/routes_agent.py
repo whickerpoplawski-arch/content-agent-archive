@@ -127,6 +127,20 @@ async def get_console_run(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found") from exc
 
 
+@router.get("/runs/{run_id}/context_usage")
+async def get_console_run_context_usage(
+    run_id: str,
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Latest TokenUsageSnapshot for a console run. 200 + latest=null when none yet."""
+    from app.agent.run_manager import run_manager
+
+    try:
+        return run_manager.context_usage(run_id, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+
+
 @router.get("/runs/{run_id}/events")
 async def stream_console_run_events(
     run_id: str,

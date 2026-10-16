@@ -240,6 +240,10 @@ def test_agent_console_page_exposes_live_run_controls():
     assert 'id="approvalDialog"' in html
     assert "new EventSource" in html
     assert "/agent/runs" in html
+    assert 'id="contextChip"' in html
+    assert 'id="contextPopover"' in html
+    assert "context_usage" in html
+    assert "/context_usage" in html
 
 
 def test_home_page_links_to_agent_console():
