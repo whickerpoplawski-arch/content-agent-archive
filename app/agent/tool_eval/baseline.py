@@ -7,7 +7,9 @@ registers ``TopicsDraft`` on ``MockLLMBackend`` and never opens a live client.
 from __future__ import annotations
 
 import hashlib
+import re
 from contextlib import contextmanager
+from datetime import date
 from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict
@@ -23,6 +25,61 @@ from app.services.topic_service import load_prompt_template, render_topic_prompt
 
 class BarePathViolation(AssertionError):
     """Raised when the bare path touches the tool registry."""
+
+
+BLOCKED_LIVE = "blocked: need OPENAI_API_KEY (or Codex)"
+
+
+def live_credentials_ready() -> bool:
+    return bool((settings.openai_api_key or "").strip())
+
+
+def require_live_credentials() -> str:
+    """Return the live model id. Raise when no key is configured."""
+    if not live_credentials_ready():
+        raise RuntimeError(BLOCKED_LIVE)
+    return settings.openai_model
+
+
+def model_slug(model_id: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model_id or "").strip("-")
+    return slug or "live-model"
+
+
+def live_run_commands(model_id: str | None = None) -> str:
+    """Copy-paste commands for a formal live G3. No scores."""
+    model = model_id or settings.openai_model or "deepseek-v4-flash"
+    slug = model_slug(model)
+    day = date.today().isoformat()
+    return (
+        f"{BLOCKED_LIVE}\n\n"
+        "Set OPENAI_API_KEY in the environment or .env, or provide "
+        "~/.codex/auth.json (OPENAI_API_KEY) and ~/.codex/config.toml (model, base_url). "
+        "Optional overrides: OPENAI_BASE_URL, OPENAI_MODEL. "
+        f"The recorded model_id is settings.openai_model ({model}). "
+        "Pass that same id to --model. Do not start training.\n\n"
+        "python scripts/compare_m0.py --stage m0 \\\n"
+        "    --eval data/evals/tool_calling_v0.jsonl \\\n"
+        f"    --backend live --model {model} \\\n"
+        f"    --out experiments/baselines/m0_bare_llm/{slug}/{day}\n\n"
+        "python scripts/eval_tool_calling.py --mode live \\\n"
+        "    --eval data/evals/tool_calling_v0.jsonl \\\n"
+        "    --repeat 1 --out experiments/runs --report reports/gate \\\n"
+        f"    --m0 experiments/baselines/m0_bare_llm/{slug}/{day}/cases.jsonl \\\n"
+        "    --latch-meta experiments/runs/run_2026-10-22_51e8496_mock.meta.json\n\n"
+        "python scripts/compare_m0.py --stage g3 --backend live \\\n"
+        "    --agent-run experiments/runs/run_<date>_<commit7>_live.jsonl \\\n"
+        f"    --m0 experiments/baselines/m0_bare_llm/{slug}/{day}/cases.jsonl \\\n"
+        "    --latch-meta experiments/runs/run_2026-10-22_51e8496_mock.meta.json \\\n"
+        "    --out reports/gate/<date>_<commit7>_live_g3.json\n"
+    )
+
+
+def redact_secret(text: str) -> str:
+    key = (settings.openai_api_key or "").strip()
+    if key and key in text:
+        text = text.replace(key, "[redacted]")
+    return text[:500]
 
 
 class TopicDraftItem(BaseModel):
@@ -136,6 +193,16 @@ def _angles_from_draft(draft: TopicsDraft, audience: str) -> list[dict[str, Any]
     return angles
 
 
+def live_topics_draft(request: TopicGenerateRequest) -> TopicsDraft:
+    """Bare live call. Uses ``generate_topics`` and the shared prompt, not the registry."""
+    from app.services.topic_service import generate_topics
+
+    response = generate_topics(request)
+    return TopicsDraft(
+        topics=[TopicDraftItem(title=item.title, reason=item.reason) for item in response.topics]
+    )
+
+
 def build_mock_backend(request: TopicGenerateRequest) -> MockLLMBackend:
     label = request.summary.strip() or "（空主题）"
     draft = mock_topics_draft(label, request.count)
@@ -154,15 +221,19 @@ async def run_m0_case(
     max_tokens: int | None,
     prompt_digest: str,
     backend: MockLLMBackend | None = None,
+    live: bool = False,
 ) -> dict[str, Any]:
     """Generate angles for one case without tools. Raises if a tool is called."""
     request = case_to_request(case)
     prompt = render_topic_prompt(request)
     if "只输出 JSON" not in prompt or request.summary not in prompt:
         raise RuntimeError("M0 prompt is not the shared topic_generation_prompt")
-    llm = backend or build_mock_backend(request)
     try:
-        draft = await llm.generate(prompt, TopicsDraft, temperature=temperature)
+        if live:
+            draft = live_topics_draft(request)
+        else:
+            llm = backend or build_mock_backend(request)
+            draft = await llm.generate(prompt, TopicsDraft, temperature=temperature)
     except BarePathViolation:
         raise
     except Exception as exc:  # noqa: BLE001 — parse/backend failure becomes a row
@@ -176,8 +247,8 @@ async def run_m0_case(
             status="degraded",
             parsed=False,
             angles=[],
-            raw={"error": str(exc)},
-            message=str(exc),
+            raw={"error": redact_secret(str(exc))},
+            message=redact_secret(str(exc)),
         )
         return _finish_row(case, row)
 
@@ -267,9 +338,16 @@ async def run_m0(
     eval_path: str = "",
     eval_sha256: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run every case on the bare path. ``backend_name`` must be ``mock``."""
-    if backend_name != "mock":
-        raise ValueError("this round only runs backend=mock; live M0 is out of scope")
+    """Run every case on the bare path. ``live`` calls the shared topic model."""
+    if backend_name not in {"mock", "live"}:
+        raise ValueError(f"unsupported backend: {backend_name}")
+    if backend_name == "live":
+        require_live_credentials()
+        if model_id != settings.openai_model:
+            raise ValueError(
+                f"model_id {model_id} != settings.openai_model {settings.openai_model}; "
+                "refusing so a formal G3 is not void"
+            )
     temperature = float(settings.openai_temperature)
     max_tokens = None
     digest = prompt_sha256()
@@ -284,6 +362,7 @@ async def run_m0(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 prompt_digest=digest,
+                live=backend_name == "live",
             )
             delta = counter["n"] - before
             row["tool_calls_total"] = delta

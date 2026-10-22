@@ -5,9 +5,10 @@
         --eval data/evals/tool_calling_v0.jsonl \\
         --repeat 3 --out experiments/runs --report reports/gate
 
-``--mode mock`` only. The frozen sha is checked first (exit 2 on mismatch).
-G3 runs only after G1, G2, and G5 are green, and a mock G3 is marked as a
-pipeline check rather than a formal result.
+``--mode mock`` checks the pipeline. ``--mode live`` calls the configured
+model. Live G3 is formal only when the mock G1/G2/G5 latch is already green
+(``--latch-meta``) and the M0 file used the same model, temperature, and count.
+A missing API key exits 2 and prints the commands. It does not invent scores.
 """
 
 from __future__ import annotations
@@ -38,8 +39,11 @@ from app.agent.tool_eval.gate import (  # noqa: E402
     write_jsonl,
 )
 from app.agent.tool_eval.assertions import evaluate  # noqa: E402
+from app.agent.tool_eval.baseline import live_run_commands, require_live_credentials  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.services.topic_helper import run_topic_helper  # noqa: E402
+
+_MOCK_M0 = "experiments/baselines/m0_bare_llm/mock-topic/2026-10-22/cases.jsonl"
 
 _DECISION = (
     "tool_empty 处理：knowledge_search 已调用且 kb_count=0 时，"
@@ -117,17 +121,28 @@ def _repeats_match(runs: list[list[dict]]) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Tool-calling gate runner")
-    parser.add_argument("--mode", required=True, choices=["mock"])
+    parser.add_argument("--mode", required=True, choices=["mock", "live"])
     parser.add_argument("--eval", default="data/evals/tool_calling_v0.jsonl")
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--out", default="experiments/runs")
     parser.add_argument("--report", default="reports/gate")
     parser.add_argument(
         "--m0",
-        default="experiments/baselines/m0_bare_llm/mock-topic/2026-10-22/cases.jsonl",
-        help="M0 cases.jsonl used only when G1/G2/G5 are green",
+        default=None,
+        help="M0 cases.jsonl. Mock defaults to the checked-in mock-topic card. Live requires an explicit live card.",
+    )
+    parser.add_argument(
+        "--latch-meta",
+        default=None,
+        help="Mock gate meta with g1/g2/g5 true. Required for a formal live G3 when this run's own G5 is not_run.",
     )
     args = parser.parse_args()
+    if args.mode == "live":
+        try:
+            require_live_credentials()
+        except RuntimeError:
+            print(live_run_commands(), file=sys.stderr)
+            return 2
     if args.repeat < 1:
         print("repeat must be >= 1", file=sys.stderr)
         return 2
@@ -152,11 +167,25 @@ def main() -> int:
     matched = _repeats_match(runs)
     summary = summarize_gates(runs[0], repeat=args.repeat, repeats_match=matched, sha_ok=True)
     g3 = None
-    m0_path = Path(args.m0)
-    if not m0_path.is_absolute():
-        m0_path = PROJECT_ROOT / m0_path
-    if latch_open(summary) and m0_path.is_file():
-        g3 = compare_g3(runs[0], load_jsonl(m0_path))
+    m0_arg = args.m0 if args.m0 is not None else (_MOCK_M0 if args.mode == "mock" else None)
+    m0_path = None
+    if m0_arg:
+        m0_path = Path(m0_arg)
+        if not m0_path.is_absolute():
+            m0_path = PROJECT_ROOT / m0_path
+    inherited = False
+    if args.latch_meta:
+        latch_path = Path(args.latch_meta)
+        if not latch_path.is_absolute():
+            latch_path = PROJECT_ROOT / latch_path
+        try:
+            inherited_meta = json.loads(latch_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        inherited = bool(inherited_meta.get("g1") and inherited_meta.get("g2") and inherited_meta.get("g5"))
+    if (latch_open(summary) or inherited) and m0_path is not None and m0_path.is_file():
+        g3 = compare_g3(runs[0], load_jsonl(m0_path), backend=args.mode)
     commit = _commit7()
     day = date.today().isoformat()
     stem = f"run_{day}_{commit}_{args.mode}"
@@ -168,8 +197,10 @@ def main() -> int:
         report_dir = PROJECT_ROOT / report_dir
     run_path = out_dir / f"{stem}.jsonl"
     meta_path = out_dir / f"{stem}.meta.json"
-    report_path = report_dir / f"{day}_{commit}_gate.md"
-    diag_path = report_dir / f"{day}_diag.md"
+    report_name = f"{day}_{commit}_live_gate.md" if args.mode == "live" else f"{day}_{commit}_gate.md"
+    diag_name = f"{day}_live_diag.md" if args.mode == "live" else f"{day}_diag.md"
+    report_path = report_dir / report_name
+    diag_path = report_dir / diag_name
     write_jsonl(run_path, runs[0])
     meta = {
         "sha256": digest,
@@ -182,8 +213,9 @@ def main() -> int:
         "g4": summary["G4"]["pass"],
         "g5": summary["G5"]["pass"],
         "g5_verdict": summary["G5"]["verdict"],
-        "latch_open": latch_open(summary),
+        "latch_open": latch_open(summary) or inherited,
         "g3": g3["verdict"] if g3 else "not_run",
+        "g3_formal": bool(g3 and g3.get("formal")),
         "decision": _DECISION,
         "run": str(run_path.relative_to(PROJECT_ROOT)) if run_path.is_relative_to(PROJECT_ROOT) else str(run_path),
     }

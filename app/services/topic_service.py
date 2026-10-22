@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -61,6 +62,26 @@ def build_llm() -> ChatOpenAI:
     return ChatOpenAI(**llm_kwargs)
 
 
+def parse_topics_payload(result_text: str) -> TopicGenerateResponse:
+    """Parse the shared topic prompt's JSON, including fenced model output."""
+    raw = (result_text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(raw[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM JSON was not an object")
+    topics = [TopicItem(**item) for item in parsed.get("topics") or []]
+    return TopicGenerateResponse(topics=topics)
+
+
 def generate_topics(request: TopicGenerateRequest) -> TopicGenerateResponse:
     template = load_prompt_template()
 
@@ -73,9 +94,6 @@ def generate_topics(request: TopicGenerateRequest) -> TopicGenerateResponse:
     result_text = chain.invoke(topic_prompt_inputs(request))
 
     try:
-        parsed = json.loads(result_text)
-        topics_data = parsed.get("topics", [])
-        topics = [TopicItem(**item) for item in topics_data]
-        return TopicGenerateResponse(topics=topics)
+        return parse_topics_payload(result_text)
     except Exception as e:
         raise ValueError(f"Failed to parse LLM output as JSON: {e}\nRaw output:\n{result_text}")

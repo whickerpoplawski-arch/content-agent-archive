@@ -209,12 +209,25 @@ def _gate_of(name: str) -> str:
     return "G1"
 
 
-def compare_g3(agent_rows: list[dict[str, Any]], m0_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Pipeline comparison. ``formal`` stays false for backend=mock."""
+def _same_number(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except (TypeError, ValueError):
+        return left == right
+
+
+def compare_g3(
+    agent_rows: list[dict[str, Any]],
+    m0_rows: list[dict[str, Any]],
+    *,
+    backend: str = "mock",
+) -> dict[str, Any]:
+    """Compare ok-class buckets. Live + matching decode is the formal G3."""
     m0_by_id = {str(row.get("id")): row for row in m0_rows}
     wins = ties = losses = 0
     deltas: list[float] = []
     skipped = 0
+    count_mismatch = False
     for row in agent_rows:
         if not in_main_mean(str(row.get("bucket") or "")):
             continue
@@ -222,6 +235,8 @@ def compare_g3(agent_rows: list[dict[str, Any]], m0_rows: list[dict[str, Any]]) 
         if other is None:
             skipped += 1
             continue
+        if row.get("count") != other.get("count"):
+            count_mismatch = True
         agent_score = float((row.get("rubric") or {}).get("score") or 0)
         m0_score = float((other.get("rubric") or {}).get("score") or 0)
         deltas.append(agent_score - m0_score)
@@ -239,10 +254,21 @@ def compare_g3(agent_rows: list[dict[str, Any]], m0_rows: list[dict[str, Any]]) 
     m0_model = str((m0_rows[0].get("model_id") if m0_rows else "") or "")
     agent_temp = agent_rows[0].get("temperature") if agent_rows else None
     m0_temp = m0_rows[0].get("temperature") if m0_rows else None
-    same_decode = agent_model == m0_model and agent_temp == m0_temp
+    same_decode = agent_model == m0_model and _same_number(agent_temp, m0_temp) and not count_mismatch
+    formal = backend == "live" and same_decode
+    if backend == "live" and formal:
+        verdict = "PASS" if numeric_pass else "FAIL"
+        note = "backend=live。这是正式 G3（mock G3 只验证流水线）。"
+    elif backend == "live":
+        verdict = "FAIL"
+        note = "backend=live。model_id、temperature 或 count 与 M0 不一致，正式 G3 作废。"
+    else:
+        verdict = "pipeline"
+        note = "backend=mock，仅流水线，不作正式 G3 结论。"
     return {
-        "verdict": "pipeline",
-        "formal": False,
+        "verdict": verdict,
+        "formal": formal,
+        "backend": backend,
         "numeric_pass": numeric_pass and same_decode,
         "wins": wins,
         "ties": ties,
@@ -254,7 +280,7 @@ def compare_g3(agent_rows: list[dict[str, Any]], m0_rows: list[dict[str, Any]]) 
         "agent_model": agent_model,
         "m0_model": m0_model,
         "same_decode": same_decode,
-        "note": "backend=mock，仅流水线，不作正式 G3 结论。",
+        "note": note,
     }
 
 
@@ -282,7 +308,7 @@ def render_gate_markdown(
         n = g3["n"] or 1
         win_rate = g3["win_rate"] if g3["win_rate"] is not None else 0.0
         g3_line = (
-            "G3 相对基线         pipeline"
+            f"G3 相对基线         {g3['verdict']}"
             f"    win {g3['wins'] / n:.2f} | tie {g3['ties'] / n:.2f} | loss {g3['losses'] / n:.2f}"
             f" | win_rate {win_rate:.2f} | Δ {(delta or 0):+.2f}   ({g3['note']})"
         )
@@ -326,7 +352,10 @@ def render_gate_markdown(
     else:
         lines.append("  无")
     lines.append(f"备注：{decision}")
-    lines.append("备注：mock 下 G3 只验证流水线；正式 G3 需 live 或微调模型。未跑项为 not_run。")
+    if g3 and g3.get("formal"):
+        lines.append("备注：backend=live。这是正式 G3。此前 mock G3 只验证流水线。未跑项为 not_run。")
+    else:
+        lines.append("备注：mock 下 G3 只验证流水线；正式 G3 需 live 或微调模型。未跑项为 not_run。")
     lines.append("")
     return "\n".join(lines)
 

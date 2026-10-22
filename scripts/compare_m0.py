@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
-"""Run the M0 bare-topic baseline and write a scorecard.
+"""Run the M0 bare-topic baseline, or compare it to an agent gate run (G3).
+
+Mock baseline (pipeline only, not a formal G3):
 
     python scripts/compare_m0.py --stage m0 \\
         --eval data/evals/tool_calling_v0.jsonl \\
         --backend mock --model mock-topic \\
         --out experiments/baselines/m0_bare_llm/mock-topic/2026-10-22
 
-This round accepts ``--backend mock`` only. The scorecard says the run checks
-the pipeline and is not a formal G3 result. Gates that this script does not
-execute are written as ``not_run``.
+Live baseline (same ``settings.openai_model``, temperature, and count as the
+agent path). A missing key prints ``blocked: need OPENAI_API_KEY (or Codex)``
+and the copy-paste commands, then exits 2. It does not invent scores.
+
+    python scripts/compare_m0.py --stage m0 \\
+        --eval data/evals/tool_calling_v0.jsonl \\
+        --backend live --model "$OPENAI_MODEL" \\
+        --out experiments/baselines/m0_bare_llm/<model>/<date>
+
+Formal G3 (ok-class buckets only) after G1/G2/G5 are already green. Live runs
+are stochastic, so pass the mock latch file instead of requiring repeat=3:
+
+    python scripts/compare_m0.py --stage g3 --backend live \\
+        --agent-run experiments/runs/run_<date>_<commit7>_live.jsonl \\
+        --m0 experiments/baselines/m0_bare_llm/<model>/<date>/cases.jsonl \\
+        --latch-meta experiments/runs/run_2026-10-22_51e8496_mock.meta.json \\
+        --out reports/gate/<date>_<commit7>_live_g3.json
 """
 
 from __future__ import annotations
@@ -23,7 +39,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.agent.tool_eval.baseline import eval_digest, run_m0  # noqa: E402
+from app.agent.tool_eval.baseline import (  # noqa: E402
+    eval_digest,
+    live_run_commands,
+    require_live_credentials,
+    run_m0,
+)
 from app.agent.tool_eval.case import load_cases  # noqa: E402
 from app.agent.tool_eval.gate import compare_g3, load_jsonl  # noqa: E402
 from app.agent.tool_eval.report import write_scorecard  # noqa: E402
@@ -36,29 +57,50 @@ def _resolve(path: str) -> Path:
     return candidate
 
 
+def _latch_meta(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(f"G3 not_run: missing gate meta {path}")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if not (meta.get("g1") and meta.get("g2") and meta.get("g5")):
+        raise ValueError("G3 not_run: G1/G2/G5 latch is closed")
+    return meta
+
+
+def _infer_backend(agent_rows: list[dict], explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    modes = {str(row.get("mode") or "") for row in agent_rows}
+    if modes == {"live"}:
+        return "live"
+    return "mock"
+
+
 def _run_g3(args: argparse.Namespace) -> int:
     if not args.agent_run or not args.m0:
         print("g3 requires --agent-run and --m0", file=sys.stderr)
         return 2
+    if args.backend not in {None, "mock", "live"}:
+        print("g3 --backend must be mock or live", file=sys.stderr)
+        return 2
     agent_path = _resolve(args.agent_run)
     m0_path = _resolve(args.m0)
-    meta_path = agent_path.with_suffix(".meta.json")
-    if not meta_path.is_file():
-        print("G3 not_run: missing gate meta; G1/G2/G5 latch is unknown", file=sys.stderr)
-        return 2
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    if not (meta.get("g1") and meta.get("g2") and meta.get("g5")):
-        print("G3 not_run: G1/G2/G5 latch is closed", file=sys.stderr)
-        return 2
+    latch_path = _resolve(args.latch_meta) if args.latch_meta else agent_path.with_suffix(".meta.json")
     try:
-        result = compare_g3(load_jsonl(agent_path), load_jsonl(m0_path))
+        _latch_meta(latch_path)
+        agent_rows = load_jsonl(agent_path)
+        backend = _infer_backend(agent_rows, args.backend)
+        if backend not in {"mock", "live"}:
+            print("g3 --backend must be mock or live", file=sys.stderr)
+            return 2
+        result = compare_g3(agent_rows, load_jsonl(m0_path), backend=backend)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(exc, file=sys.stderr)
         return 2
     print(
-        "G3 pipeline "
+        f"G3 {result['verdict']} "
         f"win_rate={result['win_rate']} delta={result['delta']} "
         f"numeric_pass={result['numeric_pass']} formal={result['formal']} "
+        f"backend={result['backend']} "
         f"({result['note']})"
     )
     if args.out:
@@ -70,22 +112,45 @@ def _run_g3(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="M0 bare-LLM baseline and mock G3 pipeline check")
+    parser = argparse.ArgumentParser(description="M0 bare-LLM baseline and G3 compare")
     parser.add_argument("--stage", required=True, choices=["m0", "g3"])
     parser.add_argument("--eval", help="Path to the frozen eval JSONL (m0)")
-    parser.add_argument("--backend", help="mock (live is rejected)")
-    parser.add_argument("--model", help="model_id recorded on the scorecard")
+    parser.add_argument("--backend", help="mock or live")
+    parser.add_argument("--model", help="model_id recorded on the scorecard; live defaults to settings.openai_model")
     parser.add_argument("--out", help="m0 directory, or g3 json path")
     parser.add_argument("--agent-run", help="Gate run jsonl (g3)")
     parser.add_argument("--m0", help="M0 cases.jsonl (g3)")
+    parser.add_argument(
+        "--latch-meta",
+        help="Gate meta JSON with g1, g2, and g5 true. Defaults to the agent run's sibling .meta.json",
+    )
     args = parser.parse_args()
     if args.stage == "g3":
         return _run_g3(args)
-    if not args.eval or not args.backend or not args.model or not args.out:
-        print("m0 requires --eval --backend --model --out", file=sys.stderr)
+    if not args.eval or not args.backend or not args.out:
+        print("m0 requires --eval --backend --out", file=sys.stderr)
         return 2
-    if args.backend != "mock":
-        print("refusing non-mock backend; this round only validates the M0 pipeline", file=sys.stderr)
+    if args.backend not in {"mock", "live"}:
+        print("m0 --backend must be mock or live", file=sys.stderr)
+        return 2
+    model = args.model
+    if args.backend == "live":
+        try:
+            recorded = require_live_credentials()
+        except RuntimeError:
+            print(live_run_commands(args.model), file=sys.stderr)
+            return 2
+        if not model:
+            model = recorded
+        elif model != recorded:
+            print(
+                f"model_id {model} != settings.openai_model {recorded}; "
+                "refusing so a formal G3 is not void",
+                file=sys.stderr,
+            )
+            return 2
+    elif not model:
+        print("m0 mock requires --model", file=sys.stderr)
         return 2
     eval_path = Path(args.eval)
     if not eval_path.is_absolute():
@@ -103,7 +168,7 @@ def main() -> int:
         rows, meta = asyncio.run(
             run_m0(
                 cases,
-                model_id=args.model,
+                model_id=model,
                 backend_name=args.backend,
                 eval_path=str(eval_path.relative_to(PROJECT_ROOT)) if eval_path.is_relative_to(PROJECT_ROOT) else str(eval_path),
                 eval_sha256=digest,

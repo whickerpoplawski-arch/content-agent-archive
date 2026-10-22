@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -137,9 +138,105 @@ def test_fake_metric_drops_the_honest_point():
     assert scored["fake_metric_hits"] >= 1
 
 
-def test_live_backend_is_rejected():
-    async def _run():
-        await run_m0([], model_id="mock-topic", backend_name="live")
+def _live_settings(monkeypatch, *, key: str, model: str = "deepseek-v4-flash"):
+    from app.core.config import settings
 
-    with pytest.raises(ValueError):
+    monkeypatch.setattr(settings, "openai_api_key", key)
+    monkeypatch.setattr(settings, "openai_model", model)
+
+
+def test_live_without_key_is_blocked(monkeypatch):
+    _live_settings(monkeypatch, key="")
+
+    async def _run():
+        await run_m0([], model_id="deepseek-v4-flash", backend_name="live")
+
+    with pytest.raises(RuntimeError, match="blocked: need OPENAI_API_KEY"):
         asyncio.run(_run())
+
+
+def test_live_rejects_a_different_model(monkeypatch):
+    _live_settings(monkeypatch, key="sk-test", model="deepseek-v4-flash")
+
+    async def _run():
+        await run_m0([], model_id="other-model", backend_name="live")
+
+    with pytest.raises(ValueError, match="formal G3"):
+        asyncio.run(_run())
+
+
+def test_live_m0_calls_generate_topics_and_stays_bare(monkeypatch, tmp_path):
+    from app.models.schemas import TopicGenerateResponse, TopicItem
+
+    _live_settings(monkeypatch, key="sk-test-secret", model="deepseek-v4-flash")
+    calls = {"n": 0}
+
+    def fake_generate(request):
+        calls["n"] += 1
+        assert request.summary.strip()
+        return TopicGenerateResponse(
+            topics=[
+                TopicItem(title="宿舍护肤清单：怎么做", reason="按步骤写清怎么做，控制在几分钟。"),
+                TopicItem(title="宿舍护肤避雷步骤", reason="说明哪里容易做错以及怎么改。"),
+                TopicItem(title="宿舍护肤公式与分钟", reason="按分钟拆开，写清每一步。"),
+                TopicItem(title="宿舍护肤如何分步", reason="方便照着做。"),
+            ]
+        )
+
+    monkeypatch.setattr("app.services.topic_service.generate_topics", fake_generate)
+    cases = [case for case in load_cases() if case.id == "tc_001"]
+    rows, meta = asyncio.run(
+        run_m0(
+            cases,
+            model_id="deepseek-v4-flash",
+            backend_name="live",
+            eval_path="data/evals/tool_calling_v0.jsonl",
+            eval_sha256="abc",
+        )
+    )
+    assert calls["n"] == 1
+    assert meta["backend"] == "live"
+    assert meta["model_id"] == "deepseek-v4-flash"
+    assert meta["temperature"] == 0.7
+    assert meta["max_tokens"] is None
+    row = rows[0]
+    assert row["tool_calls_total"] == 0
+    assert row["trace"]["steps"] == []
+    assert row["parsed"] is True
+    assert row["angles"][0]["grounded_from"] == []
+    assert "sk-test-secret" not in json.dumps(row, ensure_ascii=False)
+    card = write_scorecard(tmp_path, rows, meta)
+    assert card["formal_g3"] is False
+    assert "backend=live" in card["note"]
+
+
+def test_live_error_redacts_the_api_key(monkeypatch):
+    _live_settings(monkeypatch, key="sk-test-secret", model="deepseek-v4-flash")
+
+    def boom(_request):
+        raise RuntimeError("auth failed for sk-test-secret")
+
+    monkeypatch.setattr("app.services.topic_service.generate_topics", boom)
+    cases = [case for case in load_cases() if case.id == "tc_001"]
+    rows, _meta = asyncio.run(
+        run_m0(
+            cases,
+            model_id="deepseek-v4-flash",
+            backend_name="live",
+            eval_path="data/evals/tool_calling_v0.jsonl",
+            eval_sha256="abc",
+        )
+    )
+    blob = json.dumps(rows[0], ensure_ascii=False)
+    assert "sk-test-secret" not in blob
+    assert "[redacted]" in rows[0]["message"]
+    assert rows[0]["parsed"] is False
+    assert rows[0]["tool_calls_total"] == 0
+
+
+def test_parse_topics_payload_strips_fences():
+    from app.services.topic_service import parse_topics_payload
+
+    parsed = parse_topics_payload('```json\n{"topics":[{"title":"a","reason":"b"}]}\n```')
+    assert parsed.topics[0].title == "a"
+    assert parsed.topics[0].reason == "b"

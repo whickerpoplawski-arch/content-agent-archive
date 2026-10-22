@@ -71,7 +71,11 @@ def summarize(rows: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any
         "stage": "m0",
         "backend": meta.get("backend"),
         "formal_g3": False,
-        "note": "backend=mock。本报告只验证 M0 流水线，不作正式 G3 结论。",
+        "note": (
+            "backend=live。这是正式 G3 的裸生成基线，本卡不是胜负结论。"
+            if meta.get("backend") == "live"
+            else "backend=mock。本报告只验证 M0 流水线，不作正式 G3 结论。"
+        ),
         "model_id": meta.get("model_id"),
         "temperature": meta.get("temperature"),
         "max_tokens": meta.get("max_tokens"),
@@ -161,6 +165,10 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"| {name} | {entry['n']} | {_fmt_mean(entry['mean'])} | "
             f"{'yes' if entry['in_main_mean'] else 'no'}{extra} |"
         )
+    if summary.get("backend") == "live":
+        g3_note = "backend=live。这是正式 G3 的裸生成基线，本卡不是胜负结论"
+    else:
+        g3_note = "backend=mock，本轮只跑 M0，未做 Agent 对比，不作正式 G3 结论"
     lines.extend(
         [
             "",
@@ -168,7 +176,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
             "",
             "- G1 调用正确: not_run",
             "- G2 结果融入: not_run",
-            "- G3 相对基线: not_run（backend=mock，本轮只跑 M0，未做 Agent 对比，不作正式 G3 结论）",
+            f"- G3 相对基线: not_run（{g3_note}）",
             "- G4 失败可控: not_run",
             "- G5 可复现: not_run",
             "",
