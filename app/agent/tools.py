@@ -539,6 +539,27 @@ def _coerce_params(schema: Type[BaseModel], params: dict[str, Any]) -> dict[str,
     return out
 
 
+# Demo topic-helper slice (docs/contracts/tool_calling_io_v0.md).
+# Default on: retrieval + topic generation. Crawl, copy, images, and publish stay off.
+DEMO_ALLOWLIST: list[str] = [
+    "knowledge_search",
+    "load_notes",
+    "analyze_notes",
+    "generate_topics",
+]
+
+# read_artifact / load_skill are out of v0 scope, so they stay off with the side-effect tools.
+DEMO_DENYLIST: list[str] = [
+    "crawl_notes",
+    "generate_contents",
+    "generate_images",
+    "publish_to_xhs",
+    "sync_to_feishu",
+    "read_artifact",
+    "load_skill",
+]
+
+
 def build_default_registry(
     tool_overrides: Optional[dict[str, Handler]] = None,
 ) -> ToolRegistry:
