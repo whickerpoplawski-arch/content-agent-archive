@@ -84,6 +84,7 @@ async def run_topic_helper(
     allow_tools: Optional[list[str]] = None,
     mode: str = "mock",
     trace_dir: Optional[str | Path] = None,
+    kb_docs: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Run the demo path and return ``{status, angles, trace, meta}``.
 
@@ -144,9 +145,12 @@ async def run_topic_helper(
 
     wanted = _clamp_count(count)
     registry = build_demo_registry(mode, allowed)
+    if kb_docs is not None and "knowledge_search" in registry.names():
+        _bind_snapshot_search(registry, kb_docs)
     steps: list[dict[str, Any]] = []
 
     knowledge: Optional[dict[str, Any]] = None
+    searched = False
     if "knowledge_search" in allowed:
         knowledge, _ok = await _try_call(
             registry,
@@ -154,6 +158,7 @@ async def run_topic_helper(
             {"query": cleaned, "top_k": 5},
             steps,
         )
+        searched = True
 
     kb_count = 0
     hits: list[dict[str, Any]] = []
@@ -164,8 +169,10 @@ async def run_topic_helper(
             hits = [h for h in raw_hits if isinstance(h, dict)]
 
     analysis: Optional[dict[str, Any]] = None
-    # Template B: empty KB, and the caller left sample-note tools enabled.
-    if kb_count <= 0 and "load_notes" in allowed and "analyze_notes" in allowed:
+    # Empty retrieval must stay empty. Sample notes would look like evidence and
+    # turn a tool_empty case into status=ok.
+    empty_search = searched and kb_count <= 0
+    if not empty_search and kb_count <= 0 and "load_notes" in allowed and "analyze_notes" in allowed:
         notes, notes_ok = await _try_call(registry, "load_notes", {}, steps)
         items = notes if notes_ok and isinstance(notes, list) else []
         if items:
@@ -209,6 +216,7 @@ async def run_topic_helper(
     trace = {"steps": steps, "forbidden_hits": []}
     grounded = _grounded_from(steps)
     has_evidence = kb_count > 0 or analysis is not None
+    evidence_text = str(hits[0].get("text") or "").strip() if hits else ""
 
     if not topics_ok or not isinstance(topics_result, dict):
         return finish({
@@ -227,7 +235,17 @@ async def run_topic_helper(
         audience=audience_value,
         grounded_from=grounded,
         has_evidence=has_evidence,
+        evidence_text=evidence_text if has_evidence else "",
     )[:wanted]
+
+    if empty_search:
+        return finish({
+            "status": "degraded",
+            "angles": angles,
+            "message": "知识库没有命中，未使用样例笔记回退",
+            "trace": trace,
+            "meta": meta,
+        })
 
     if len(angles) < 3:
         return finish({
@@ -308,6 +326,54 @@ def _focus_keywords(theme: str, extra: Optional[list[str]] = None) -> list[str]:
     return keys[:8]
 
 
+# One shared 2-gram (for example 收纳) is not enough to treat a snapshot doc as evidence.
+_MIN_SNAPSHOT_OVERLAP = 2
+
+
+def _cjk_bigrams(text: str) -> set[str]:
+    chars = [ch for ch in text if "\u4e00" <= ch <= "\u9fff"]
+    return {a + b for a, b in zip(chars, chars[1:])}
+
+
+def search_snapshot_docs(docs: list[dict[str, Any]], query: str, top_k: int) -> list[dict[str, Any]]:
+    """Rank frozen snapshot docs by Chinese 2-gram overlap. Deterministic, offline."""
+    query_grams = _cjk_bigrams(query)
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for doc in docs:
+        blob = f"{doc.get('title') or ''}{doc.get('text') or ''}"
+        overlap = len(query_grams & _cjk_bigrams(blob))
+        if overlap < _MIN_SNAPSHOT_OVERLAP:
+            continue
+        ranked.append((overlap, str(doc.get("doc_id") or ""), doc))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    hits: list[dict[str, Any]] = []
+    for score, doc_id, doc in ranked[: max(1, top_k)]:
+        hits.append(
+            {
+                "doc_id": doc_id,
+                "title": str(doc.get("title") or ""),
+                "source": str(doc.get("source") or "manual"),
+                "score": score,
+                "text": str(doc.get("text") or "")[:300],
+            }
+        )
+    return hits
+
+
+def _bind_snapshot_search(registry: ToolRegistry, docs: list[dict[str, Any]]) -> None:
+    tool = registry.get("knowledge_search")
+
+    async def handler(params: Any) -> dict[str, Any]:
+        hits = search_snapshot_docs(docs, str(getattr(params, "query", "") or ""), int(params.top_k))
+        return {
+            "count": len(hits),
+            "hits": hits,
+            "note": "kb snapshot" if hits else "kb snapshot empty",
+        }
+
+    tool.handler = handler
+
+
 def _knowledge_hints(hits: list[dict[str, Any]]) -> list[str]:
     hints: list[str] = []
     for hit in hits[:5]:
@@ -352,7 +418,8 @@ def _result_digest(name: str, result: Any) -> dict[str, Any]:
     if name == "knowledge_search" and isinstance(result, dict):
         hits = result.get("hits") or []
         titles = [str(h.get("title") or "") for h in hits if isinstance(h, dict)]
-        return {"count": int(result.get("count") or 0), "titles": titles[:8]}
+        snippets = [str(h.get("text") or "")[:120] for h in hits if isinstance(h, dict)]
+        return {"count": int(result.get("count") or 0), "titles": titles[:8], "snippets": snippets[:8]}
     if name == "load_notes" and isinstance(result, list):
         return {"n_notes": len(result)}
     if name == "analyze_notes" and isinstance(result, dict):
@@ -448,6 +515,7 @@ def _to_angles(
     audience: str,
     grounded_from: list[str],
     has_evidence: bool,
+    evidence_text: str = "",
 ) -> list[dict[str, Any]]:
     # Prefer a generate_topics id; fall back to whatever succeeded.
     cite = [item for item in grounded_from if item.startswith("generate_topics#")]
@@ -461,10 +529,14 @@ def _to_angles(
         title, reason = _topic_fields(topic)
         if not title:
             continue
+        why = _safe_why(reason, has_evidence=has_evidence)
+        snippet = evidence_text.strip()
+        if has_evidence and snippet and snippet not in why:
+            why = f"{why}。依据：{snippet}"
         angles.append({
             "angle": _angle_from_title(title),
             "title": title,
-            "why": _safe_why(reason, has_evidence=has_evidence),
+            "why": why,
             "audience": audience,
             "grounded_from": list(cite),
         })

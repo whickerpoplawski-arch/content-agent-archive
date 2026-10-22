@@ -42,7 +42,7 @@ N = 30。
 2. 特别看 `tool_empty`：当前薄入口在知识库为空且允许 `load_notes` 时仍可能返回 `ok`。本卡把这些题标成 `degraded`。若复核后改状态，必须新建版本，不能改本文件的 sha。
 3. 通过后把上面的状态改成 `FROZEN at <date> @ <commit>`。
 4. 校验：`python scripts/freeze_evals.py --file data/evals/tool_calling_v0.jsonl --check`（不一致退出码 2）。
-5. 已知风险：默认 DEMO_ALLOWLIST 含 load_notes/analyze_notes，空检索会走样例笔记回退，薄入口可能仍返回 `ok`，与 tool_empty 的 `expect_status=degraded` 在 Gate 时可能不一致；P3 再处理，冻结集本身不因此改字节。
+5. 已知风险的处理（不改 jsonl）：`knowledge_search` 已调用且 `kb_count=0` 时，薄入口不再回退 `load_notes`/`analyze_notes`，直接 `generate_topics` 后 `status=degraded`。抽取式引文的 Jaccard 兜底阈值固定为 0.15。
 
 ## 重建快照
 

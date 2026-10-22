@@ -31,12 +31,13 @@ def test_helper_api_mock_returns_angles_and_trace(tmp_path, monkeypatch):
     )
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "ok"
+    assert data["status"] == "degraded"
     assert 3 <= len(data["angles"]) <= 5
     steps = data["trace"]["steps"]
     assert steps
     tools = [step["tool"] for step in steps]
-    assert "generate_topics" in tools
+    assert tools == ["knowledge_search", "generate_topics"]
+    assert "load_notes" not in tools
     assert set(tools).isdisjoint(DEMO_DENYLIST)
     assert data["meta"]["mode"] == "mock"
 

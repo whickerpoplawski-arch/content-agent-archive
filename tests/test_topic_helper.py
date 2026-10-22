@@ -26,10 +26,13 @@ def test_mock_success_returns_angles_and_trace(tmp_path):
         )
     )
 
-    assert result["status"] == "ok"
+    assert result["status"] == "degraded"
+    assert "样例笔记" in result["message"]
     assert 3 <= len(result["angles"]) <= 5
     tools = [step["tool"] for step in result["trace"]["steps"]]
-    assert tools == ["knowledge_search", "load_notes", "analyze_notes", "generate_topics"]
+    assert tools == ["knowledge_search", "generate_topics"]
+    assert "load_notes" not in tools
+    assert "analyze_notes" not in tools
     assert result["trace"]["forbidden_hits"] == []
     assert set(tools).isdisjoint(DEMO_DENYLIST)
 
@@ -54,7 +57,7 @@ def test_mock_success_returns_angles_and_trace(tmp_path):
     assert trace_path.exists()
     saved = json.loads(trace_path.read_text(encoding="utf-8"))
     assert saved["trace"]["steps"]
-    assert saved["status"] == "ok"
+    assert saved["status"] == "degraded"
 
 
 def test_empty_theme_refuses_without_tools(tmp_path, monkeypatch):
@@ -88,8 +91,10 @@ def test_vague_theme_clarifies_without_topic_tool(tmp_path, monkeypatch):
     specific = run(
         run_topic_helper("爆款", audience="大学生女生", mode="mock", trace_dir=tmp_path)
     )
-    assert specific["status"] == "ok"
-    assert any(step["tool"] == "generate_topics" for step in specific["trace"]["steps"])
+    assert specific["status"] == "degraded"
+    tools = [step["tool"] for step in specific["trace"]["steps"]]
+    assert tools == ["knowledge_search", "generate_topics"]
+    assert "load_notes" not in tools
 
 
 def test_policy_theme_refuses_without_tools(tmp_path, monkeypatch):
@@ -123,11 +128,68 @@ def test_allow_tools_cannot_enable_blacklist(tmp_path):
         )
     )
     tools = [step["tool"] for step in result["trace"]["steps"]]
-    assert result["status"] == "ok"
+    assert result["status"] == "degraded"
     assert tools == ["knowledge_search", "generate_topics"]
     assert result["trace"]["forbidden_hits"] == []
     assert "crawl_notes" not in tools
     assert "publish_to_xhs" not in tools
+
+
+def test_empty_search_skips_sample_notes_and_degrades(tmp_path):
+    result = run(
+        run_topic_helper("冷门小众手作蜡片收纳", mode="mock", trace_dir=tmp_path)
+    )
+    tools = [step["tool"] for step in result["trace"]["steps"]]
+    assert result["status"] == "degraded"
+    assert tools == ["knowledge_search", "generate_topics"]
+    assert result["trace"]["steps"][0]["result_digest"]["count"] == 0
+    assert "load_notes" not in tools
+    assert "analyze_notes" not in tools
+
+
+def test_snapshot_hit_is_ok_and_empty_theme_stays_degraded(tmp_path):
+    from app.agent.tool_eval.case import load_snapshot
+
+    docs = load_snapshot()["docs"]
+    hit = run(
+        run_topic_helper(
+            "宿舍党低成本护肤",
+            mode="mock",
+            trace_dir=tmp_path,
+            kb_docs=docs,
+        )
+    )
+    assert hit["status"] == "ok"
+    assert [step["tool"] for step in hit["trace"]["steps"]] == ["knowledge_search", "generate_topics"]
+    assert hit["trace"]["steps"][0]["result_digest"]["count"] >= 1
+    assert any("宿舍三件套百元内" in angle["why"] for angle in hit["angles"])
+
+    empty = run(
+        run_topic_helper(
+            "冷门小众手作蜡片收纳",
+            mode="mock",
+            trace_dir=tmp_path,
+            kb_docs=docs,
+        )
+    )
+    assert empty["status"] == "degraded"
+    assert [step["tool"] for step in empty["trace"]["steps"]] == ["knowledge_search", "generate_topics"]
+    assert empty["trace"]["steps"][0]["result_digest"]["count"] == 0
+    assert "校园巴士末班到十点" not in " ".join(angle["why"] for angle in empty["angles"])
+
+
+def test_no_retrieve_allowlist_stays_ok(tmp_path):
+    result = run(
+        run_topic_helper(
+            "面试自我介绍一分钟模板",
+            audience="职场新人",
+            allow_tools=["generate_topics"],
+            mode="mock",
+            trace_dir=tmp_path,
+        )
+    )
+    assert result["status"] == "ok"
+    assert [step["tool"] for step in result["trace"]["steps"]] == ["generate_topics"]
 
 
 def test_title_pipe_splits_angle():
