@@ -1,0 +1,16 @@
+{
+  "sha256": "52745dd1a19bdde7bdb068f34d17f0d7bf5cc2138105b357af4f49782486a053",
+  "mode": "mock",
+  "repeat": 3,
+  "commit": "51e8496",
+  "date": "2026-10-22",
+  "g1": true,
+  "g2": true,
+  "g4": true,
+  "g5": true,
+  "g5_verdict": "PASS",
+  "latch_open": true,
+  "g3": "pipeline",
+  "decision": "tool_empty 处理：knowledge_search 已调用且 kb_count=0 时，不再回退 load_notes/analyze_notes；直接 generate_topics 后 status=degraded。冻结 jsonl 未改字节。",
+  "run": "experiments/runs/run_2026-10-22_51e8496_mock.jsonl"
+}
