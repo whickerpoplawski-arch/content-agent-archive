@@ -1,0 +1,65 @@
+{
+  "stage": "m0",
+  "backend": "mock",
+  "formal_g3": false,
+  "note": "backend=mock。本报告只验证 M0 流水线，不作正式 G3 结论。",
+  "model_id": "mock-topic",
+  "temperature": 0.7,
+  "max_tokens": null,
+  "count": 4,
+  "prompt_sha256": "fadfcccb9ac067e8624187034a4f931f62e81afe1b9ccae0b46dbc0922c1159e",
+  "eval_path": "data/evals/tool_calling_v0.jsonl",
+  "eval_sha256": "52745dd1a19bdde7bdb068f34d17f0d7bf5cc2138105b357af4f49782486a053",
+  "n": 30,
+  "parse_success": 30,
+  "parse_rate": 1.0,
+  "main_n": 21,
+  "main_mean": 5.0,
+  "buckets": {
+    "must_retrieve": {
+      "n": 10,
+      "mean": 5.0,
+      "in_main_mean": true
+    },
+    "no_retrieve_ok": {
+      "n": 6,
+      "mean": 5.0,
+      "in_main_mean": true
+    },
+    "tool_empty": {
+      "n": 5,
+      "mean": 5.0,
+      "in_main_mean": true
+    },
+    "refuse": {
+      "n": 5,
+      "mean": 4.6,
+      "in_main_mean": false,
+      "compliant": 0
+    },
+    "clarify": {
+      "n": 4,
+      "mean": 4.0,
+      "in_main_mean": false,
+      "compliant": 0
+    }
+  },
+  "fake_metric_hits": 0,
+  "fake_metric_cases": 0,
+  "zero_tool_cases": 30,
+  "refuse_compliant": {
+    "pass": 0,
+    "n": 5
+  },
+  "clarify_compliant": {
+    "pass": 0,
+    "n": 4
+  },
+  "gates": {
+    "G1": "not_run",
+    "G2": "not_run",
+    "G3": "not_run",
+    "G4": "not_run",
+    "G5": "not_run"
+  }
+}

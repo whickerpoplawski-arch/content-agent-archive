@@ -1,0 +1,145 @@
+"""M0 bare path: no tools, mock backend can score a couple of frozen cases."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from app.agent.tool_eval.baseline import (
+    BarePathViolation,
+    assert_bare_trace,
+    guard_registry,
+    prompt_sha256,
+    run_m0,
+    run_m0_case,
+)
+from app.agent.tool_eval.case import load_cases
+from app.agent.tool_eval.report import write_scorecard
+from app.agent.tool_eval.rubric import FAKE_METRIC_RE, score_output
+from app.services.topic_service import load_prompt_template
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def test_assert_bare_trace_rejects_tools():
+    assert_bare_trace({"steps": []}, 0)
+    with pytest.raises(BarePathViolation):
+        assert_bare_trace({"steps": [{"tool": "knowledge_search"}]}, 0)
+    with pytest.raises(BarePathViolation):
+        assert_bare_trace({"steps": []}, 1)
+
+
+def test_guard_blocks_registry_call():
+    from app.agent.tools import ToolRegistry
+
+    async def _hit():
+        with guard_registry() as counter:
+            with pytest.raises(BarePathViolation):
+                await ToolRegistry.call(None, "generate_topics", {})
+            assert counter["n"] == 1
+
+    asyncio.run(_hit())
+
+
+def test_prompt_is_the_shared_template():
+    text = load_prompt_template()
+    assert "只输出 JSON" in text
+    assert prompt_sha256() == __import__("hashlib").sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_mock_runs_two_cases_with_zero_tools(tmp_path):
+    wanted = {"tc_001", "tc_009"}
+    cases = [case for case in load_cases() if case.id in wanted]
+    assert len(cases) == 2
+
+    async def _run():
+        return await run_m0(
+            cases,
+            model_id="mock-topic",
+            backend_name="mock",
+            eval_path="data/evals/tool_calling_v0.jsonl",
+            eval_sha256="abc",
+        )
+
+    rows, meta = asyncio.run(_run())
+    assert meta["model_id"] == "mock-topic"
+    assert meta["backend"] == "mock"
+    assert meta["temperature"] == 0.7
+    assert meta["max_tokens"] is None
+    assert meta["count"] == 4
+    assert meta["prompt_sha256"] == prompt_sha256()
+    assert len(rows) == 2
+    for row in rows:
+        assert row["trace"]["steps"] == []
+        assert row["tool_calls_total"] == 0
+        assert row["parsed"] is True
+        assert row["status"] == "ok"
+        assert 3 <= len(row["angles"]) <= 5
+        assert row["angles"][0]["grounded_from"] == []
+        assert row["rubric"]["score"] == 5
+        assert row["rubric"]["fake_metric_hits"] == 0
+        assert row["in_main_mean"] is True
+        assert "只输出 JSON" in load_prompt_template()
+        blob = " ".join(angle["title"] + angle["why"] for angle in row["angles"])
+        assert FAKE_METRIC_RE.search(blob) is None
+        assert row["theme"].strip() in row["angles"][0]["title"]
+    summary = write_scorecard(tmp_path, rows, meta)
+    assert (tmp_path / "cases.jsonl").is_file()
+    assert (tmp_path / "scorecard.md").is_file()
+    assert (tmp_path / "scorecard.json").is_file()
+    assert summary["gates"]["G3"] == "not_run"
+    assert "不作正式 G3" in (tmp_path / "scorecard.md").read_text(encoding="utf-8")
+    assert summary["main_n"] == 2
+    assert summary["refuse_compliant"]["n"] == 0
+
+
+def test_refuse_case_is_not_in_the_main_mean():
+    case = next(item for item in load_cases() if item.bucket.value == "refuse")
+    row = asyncio.run(
+        run_m0_case(
+            case,
+            model_id="mock-topic",
+            temperature=0.7,
+            max_tokens=None,
+            prompt_digest=prompt_sha256(),
+        )
+    )
+    assert row["tool_calls_total"] == 0
+    assert row["trace"]["steps"] == []
+    assert row["in_main_mean"] is False
+    assert row["compliant"] is False
+    assert row["status"] == "ok"
+
+
+def test_fake_metric_drops_the_honest_point():
+    case = next(item for item in load_cases() if item.id == "tc_001")
+    row = {
+        "status": "ok",
+        "parsed": True,
+        "message": "",
+        "angles": [
+            {
+                "angle": "宿舍护肤",
+                "title": "宿舍党低成本护肤清单",
+                "why": "这份清单的爆款率很高",
+                "audience": "大学生女生",
+                "grounded_from": [],
+            }
+        ],
+        "raw": {"topics": []},
+        "trace": {"steps": []},
+        "tool_calls_total": 0,
+    }
+    scored = score_output(case, row)
+    assert scored["honest"] == 0
+    assert scored["fake_metric_hits"] >= 1
+
+
+def test_live_backend_is_rejected():
+    async def _run():
+        await run_m0([], model_id="mock-topic", backend_name="live")
+
+    with pytest.raises(ValueError):
+        asyncio.run(_run())

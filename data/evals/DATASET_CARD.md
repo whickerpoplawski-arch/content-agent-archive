@@ -4,7 +4,7 @@
 - 快照：`data/interim/kb_snapshot_v0.json`（由 `data/raw/kb_seed_v0.jsonl` 经 `scripts/build_kb_snapshot.py` 生成）
 - sha256：`52745dd1a19bdde7bdb068f34d17f0d7bf5cc2138105b357af4f49782486a053`
 - 日期：2026-10-22
-- 状态：**READY_TO_FREEZE**（schema 已过；`expected_trace` 尚未逐条人工对照合同 §2.3 与一次 mock 运行。作者复核通过后再改为 `FROZEN at <date> @ <commit>`。在此之前禁止当训练集，也禁止开训练。）
+- 状态：**FROZEN at 2026-10-22 @ cf9f42e**（冻结内容以 jsonl sha 为准，卡修订 commit 见 git log。作者已确认 `expected_trace`。禁止当训练集。）
 
 ## 永不进训练
 
@@ -42,6 +42,7 @@ N = 30。
 2. 特别看 `tool_empty`：当前薄入口在知识库为空且允许 `load_notes` 时仍可能返回 `ok`。本卡把这些题标成 `degraded`。若复核后改状态，必须新建版本，不能改本文件的 sha。
 3. 通过后把上面的状态改成 `FROZEN at <date> @ <commit>`。
 4. 校验：`python scripts/freeze_evals.py --file data/evals/tool_calling_v0.jsonl --check`（不一致退出码 2）。
+5. 已知风险：默认 DEMO_ALLOWLIST 含 load_notes/analyze_notes，空检索会走样例笔记回退，薄入口可能仍返回 `ok`，与 tool_empty 的 `expect_status=degraded` 在 Gate 时可能不一致；P3 再处理，冻结集本身不因此改字节。
 
 ## 重建快照
 

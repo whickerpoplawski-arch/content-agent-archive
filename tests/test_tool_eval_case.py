@@ -89,7 +89,7 @@ def test_sha256_sidecar_matches():
     assert len(digest) == 64
     recorded = (REPO / "data" / "evals" / "DATASET_CARD.md").read_text(encoding="utf-8")
     assert digest in recorded
-    assert "READY_TO_FREEZE" in recorded
+    assert "FROZEN at 2026-10-22 @ cf9f42e" in recorded
     assert "永不进训练" in recorded
 
 

@@ -19,6 +19,35 @@ def load_prompt_template() -> str:
         return f.read()
 
 
+def topic_prompt_inputs(request: TopicGenerateRequest) -> dict:
+    """Variables shared by the live topic chain and the bare M0 path."""
+    return {
+        "count": request.count,
+        "audience": request.audience,
+        "summary": request.summary,
+        "top_keywords": ", ".join(request.top_keywords),
+        "top_tags": ", ".join(request.top_tags),
+        "title_patterns": ", ".join(request.title_patterns),
+        "insight_points": "\n".join(f"- {point}" for point in request.insight_points),
+        "focus_keywords": ", ".join(request.focus_keywords) or "（无）",
+        "knowledge_hints": "\n".join(f"- {h}" for h in request.knowledge_hints) or "（无）",
+    }
+
+
+def render_topic_prompt(request: TopicGenerateRequest) -> str:
+    """Fill ``topic_generation_prompt.txt``. Does not call a model."""
+    prompt = ChatPromptTemplate.from_template(load_prompt_template())
+    messages = prompt.format_messages(**topic_prompt_inputs(request))
+    parts: list[str] = []
+    for message in messages:
+        content = message.content
+        if isinstance(content, str):
+            parts.append(content)
+        else:
+            parts.append(str(content))
+    return "\n".join(parts)
+
+
 def build_llm() -> ChatOpenAI:
     llm_kwargs = {
         "model": settings.openai_model,
@@ -41,19 +70,7 @@ def generate_topics(request: TopicGenerateRequest) -> TopicGenerateResponse:
 
     chain = prompt | llm | parser
 
-    result_text = chain.invoke(
-        {
-            "count": request.count,
-            "audience": request.audience,
-            "summary": request.summary,
-            "top_keywords": ", ".join(request.top_keywords),
-            "top_tags": ", ".join(request.top_tags),
-            "title_patterns": ", ".join(request.title_patterns),
-            "insight_points": "\n".join(f"- {point}" for point in request.insight_points),
-            "focus_keywords": ", ".join(request.focus_keywords) or "（无）",
-            "knowledge_hints": chr(10).join(f"- {h}" for h in request.knowledge_hints) or "（无）",  # chr(10)=换行, 规避转义歧义
-        }
-    )
+    result_text = chain.invoke(topic_prompt_inputs(request))
 
     try:
         parsed = json.loads(result_text)
