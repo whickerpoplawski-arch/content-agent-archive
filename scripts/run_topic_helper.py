@@ -5,6 +5,11 @@ Mock is the default and does not crawl, log in, or call a live model:
 
     python scripts/run_topic_helper.py --theme "大学生平价通勤穿搭" --mode mock
 
+The same helper is on the web UI. Start the app, then open the page:
+
+    python run.py
+    # http://127.0.0.1:8000/demo/topic-helper
+
 Prints the contract JSON (``angles``, ``trace``, ``status``) and writes the
 same payload under ``data/agent/topic_helper/``.
 """

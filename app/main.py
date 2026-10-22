@@ -72,8 +72,17 @@ Path("data/output/images").mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory="data/output/images"), name="images")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
+
+_TOPIC_HELPER_PAGE = Path(__file__).resolve().parent.parent / "static" / "topic_helper.html"
+
 
 @app.get("/", tags=["Root"])
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.get("/demo/topic-helper", tags=["Demo"])
+def topic_helper_demo_page():
+    """Offline topic-helper page. Start with `python run.py`, then open this path."""
+    return FileResponse(_TOPIC_HELPER_PAGE)
