@@ -407,6 +407,13 @@ xhs_content_agent/
 
 ---
 
+## 文档
+
+- 工具调用规格：`docs/FULL_PROJECT_SPEC_tool_calling_v0.md`
+- 工具调用 I/O 合同：`docs/contracts/tool_calling_io_v0.md`
+
+---
+
 ## 技术栈
 
 - **后端框架**：FastAPI + Uvicorn
