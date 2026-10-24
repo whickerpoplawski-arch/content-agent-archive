@@ -4,6 +4,9 @@ Short-term memory tracks the results of each executed step within a run so the
 planner/reflector can reason over prior observations. Long-term memory persists
 a lightweight user profile (audience, tone, preferences) to disk so the Agent
 "learns" the target user across runs.
+
+The JSON profile stays the scalar/legacy lane. Learnings and the episodic run
+index live in SQLite (``memory.db`` next to the profile) via ``ProfileStore``.
 """
 
 from __future__ import annotations
@@ -25,10 +28,13 @@ PROFILE_FILE = MEMORY_DIR / "profile.json"
 class LongTermMemory:
     """JSON-backed store for user profile / long-lived preferences."""
 
-    def __init__(self, path: Path = PROFILE_FILE) -> None:
+    def __init__(self, path: Path = PROFILE_FILE, store=None) -> None:
         self.path = path
         self._data: dict[str, Any] = {}
+        self._store = store
         self._load()
+        if store is not None:
+            self._migrate_store()
 
     def _load(self) -> None:
         try:
@@ -53,19 +59,55 @@ class LongTermMemory:
     def set(self, key: str, value: Any) -> None:
         self._data[key] = value
         self.save()
+        self._sync_key(key, value)
 
     def set_many(self, mapping: dict[str, Any]) -> None:
         """Batch set with a single disk write (每 run 多键回写时避免多次全量重写)。"""
         self._data.update(mapping)
         self.save()
+        for key, value in mapping.items():
+            self._sync_key(key, value)
 
     def update(self, mapping: dict[str, Any]) -> None:
         self._data.update(mapping)
         self.save()
+        for key, value in mapping.items():
+            self._sync_key(key, value)
 
     @property
     def data(self) -> dict[str, Any]:
         return self._data
+
+    @property
+    def store(self):
+        """SQLite learnings + episodic index. Created beside this profile."""
+        if self._store is None:
+            from app.agent.memory_store import ProfileStore
+
+            self._store = ProfileStore(self.path.with_name("memory.db"))
+            self._migrate_store()
+        return self._store
+
+    def _migrate_store(self) -> None:
+        try:
+            self._store.migrate_profile(self._data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("profile migration skipped: %s", exc)
+
+    def _sync_key(self, key: str, value: Any) -> None:
+        """Dual-write the keys the SQLite lane understands. JSON remains intact."""
+        if key not in {"audience", "tone", "user_facts", "procedural_insights"}:
+            return
+        try:
+            store = self.store
+            if key in {"audience", "tone"} and isinstance(value, str) and value.strip():
+                store.upsert_scalar(key, value.strip())
+            elif key == "user_facts" and isinstance(value, dict):
+                store.sync_facts(value)
+            elif key == "procedural_insights" and isinstance(value, list):
+                store.sync_insights(value)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("memory store sync skipped for %s: %s", key, exc)
 
 
 class AgentMemory:

@@ -218,7 +218,15 @@ async def feedback_console_run(run_id: str, request: FeedbackRequest):
         run = run_manager.get(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Run not found") from exc
+    from app.agent.memory_scrub import scrub_memory_text
+
     memory = LongTermMemory()
+    note = (request.note or "").strip()
+    if note:
+        scrubbed = scrub_memory_text(note, reject_secrets=True)
+        if not scrubbed.ok:
+            raise HTTPException(status_code=400, detail=scrubbed.reason)
+        note = scrubbed.text
     prefs = list(memory.get("user_preferences") or [])
     prefs.append(
         {
@@ -226,11 +234,25 @@ async def feedback_console_run(run_id: str, request: FeedbackRequest):
             "goal_signature": _goal_signature(run["goal"]),
             "liked": request.liked,
             "score": request.score,
-            "note": request.note,
+            "note": note,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
     )
     memory.set("user_preferences", prefs[-MAX_PREFERENCES:])
+    if note:
+        try:
+            memory.store.learn(
+                note,
+                kind="correction",
+                lane="general",
+                source="feedback",
+                evidence=run_id,
+                confidence=0.8,
+            )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("agent.routes").warning("feedback learning skipped: %s", exc)
     audit(
         "feedback",
         run_id=run_id,
@@ -240,6 +262,129 @@ async def feedback_console_run(run_id: str, request: FeedbackRequest):
         ),
     )
     return {"ok": True, "stored": len(prefs[-MAX_PREFERENCES:])}
+
+
+class MemoryLearnRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    kind: str = "preference"
+    lane: str = "general"
+    topics: list[str] = Field(default_factory=list)
+    pinned: bool = False
+
+
+class MemoryForgetRequest(BaseModel):
+    learning_id: str = Field(..., min_length=1)
+
+
+class MemoryPinRequest(BaseModel):
+    learning_id: str = Field(..., min_length=1)
+    pinned: bool = True
+
+
+class MemoryEditRequest(BaseModel):
+    learning_id: str = Field(..., min_length=1)
+    text: str = ""
+    kind: str = ""
+    lane: str = ""
+    topics: list[str] = Field(default_factory=list)
+
+
+def _memory_store():
+    from app.agent.memory import LongTermMemory
+
+    return LongTermMemory().store
+
+
+@router.post("/memory/learn")
+async def memory_learn_endpoint(request: MemoryLearnRequest):
+    """记住一条偏好/事实/忌口。密钥类文本拒绝写入，已有记忆保持不变。"""
+    from app.agent.memory_scrub import ScrubRejected
+    from app.agent.memory_tools import MemoryLearnParams, memory_learn
+
+    try:
+        result = await memory_learn(
+            MemoryLearnParams(
+                text=request.text,
+                kind=request.kind,
+                lane=request.lane,
+                topics=request.topics,
+                pinned=request.pinned,
+            ),
+            store=_memory_store(),
+        )
+    except ScrubRejected as exc:
+        raise HTTPException(status_code=400, detail=exc.reason) from exc
+    if not result.get("ok") and result.get("refused"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "refused")
+    return result
+
+
+@router.post("/memory/forget")
+async def memory_forget_endpoint(request: MemoryForgetRequest):
+    from app.agent.memory_tools import MemoryForgetParams, memory_forget
+
+    result = await memory_forget(MemoryForgetParams(learning_id=request.learning_id), store=_memory_store())
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "learning not found")
+    return result
+
+
+@router.post("/memory/pin")
+async def memory_pin_endpoint(request: MemoryPinRequest):
+    from app.agent.memory_tools import MemoryPinParams, memory_pin
+
+    result = await memory_pin(
+        MemoryPinParams(learning_id=request.learning_id, pinned=request.pinned),
+        store=_memory_store(),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "learning not found")
+    return result
+
+
+@router.post("/memory/edit")
+async def memory_edit_endpoint(request: MemoryEditRequest):
+    from app.agent.memory_tools import MemoryEditParams, memory_edit
+
+    result = await memory_edit(
+        MemoryEditParams(
+            learning_id=request.learning_id,
+            text=request.text,
+            kind=request.kind,
+            lane=request.lane,
+            topics=request.topics,
+        ),
+        store=_memory_store(),
+    )
+    if result.get("refused"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "refused")
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "learning not found")
+    return result
+
+
+@router.get("/memory/recall")
+async def memory_recall_endpoint(q: str = "", limit: int = Query(8, ge=1, le=20)):
+    from app.agent.memory_tools import MemoryRecallParams, memory_recall
+
+    return await memory_recall(MemoryRecallParams(query=q, limit=limit), store=_memory_store())
+
+
+@router.get("/memory")
+async def memory_list_endpoint(
+    status: str = Query("active"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    store = _memory_store()
+    status_filter = None if status in {"", "all"} else status
+    items = store.list_learnings(status=status_filter, limit=limit)
+    return {
+        "items": items,
+        "count": len(items),
+        "revision": store.revision(),
+        "cursor": store.cursor(),
+        "user_id": "local",
+    }
 
 
 @router.post("/runs/{run_id}/resume")

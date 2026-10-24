@@ -37,6 +37,9 @@ class AgentTracer:
         return cls(run_id or uuid.uuid4().hex[:12], event_sink)
 
     def event(self, kind: str, **fields: Any) -> None:
+        from app.agent.memory_pack import strip_ephemeral_pack
+
+        fields = strip_ephemeral_pack(fields)
         event = {"ts": datetime.now(timezone.utc).isoformat(), "kind": kind, **fields}
         self.events.append(event)
         if self.event_sink:
