@@ -400,12 +400,24 @@ async def consolidate(
             )
         ops = await _generate_ops(backend, prompt)
         stored = apply_dream_ops(long_term, ops, goal)
+        _record_learning_cursor(long_term)
         if stored:
             logger.info("consolidated procedural insight: %s", stored.get("title"))
         return stored
     except Exception as exc:  # noqa: BLE001
         logger.warning("consolidation skipped (non-fatal): %s", exc)
         return None
+
+
+def _record_learning_cursor(long_term) -> None:
+    """Fold near-duplicate learnings and advance the consolidate cursor.
+
+    Local SQLite only — no extra model call, so it does not hold the turn.
+    """
+    try:
+        long_term.store.consolidate_learnings()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("learning consolidate skipped (non-fatal): %s", exc)
 
 
 def submit_consolidation(

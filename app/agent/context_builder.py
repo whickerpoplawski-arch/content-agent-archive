@@ -40,7 +40,10 @@ _BUCKETS = {
     "semantic": "semantic",
     "prefs": "semantic",
     "facts": "semantic",
+    "memory_general": "semantic",
+    "memory_situational": "semantic",
     "episodic": "episodic",
+    "memory_episodic": "episodic",
 }
 
 _BUCKET_NAMES = (

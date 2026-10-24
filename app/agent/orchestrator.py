@@ -95,7 +95,39 @@ class XHSAgent:
         tracer = AgentTracer.new(run_id=run_id, event_sink=event_sink)
         tracer.event("goal", goal=goal)
         memory = memory or AgentMemory(LongTermMemory())
+        store_token = _bind_run_store(memory)
+        try:
+            return await self._run_bound(
+                goal,
+                audience=audience,
+                tone=tone,
+                memory=memory,
+                tracer=tracer,
+                stop_check=stop_check,
+                approval_handler=approval_handler,
+                checkpointer=checkpointer,
+                guardrails=guardrails,
+                consolidation_pool=consolidation_pool,
+            )
+        finally:
+            _reset_run_store(store_token)
 
+    async def _run_bound(
+        self,
+        goal: str,
+        *,
+        audience: Optional[str] = None,
+        tone: Optional[str] = None,
+        memory: AgentMemory,
+        tracer: AgentTracer,
+        stop_check: Optional[Callable[[], bool]] = None,
+        approval_handler: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[bool]]
+        ] = None,
+        checkpointer=None,
+        guardrails: Optional[Guardrails] = None,
+        consolidation_pool=None,
+    ) -> AgentResult:
         # Long-term memory: persist the learned audience/tone profile.
         if audience:
             memory.long_term.update({"audience": audience})
@@ -145,8 +177,13 @@ class XHSAgent:
                     ),
                 )
                 resumed = True
+        planner_text, execute_profile, knowledge_text, pack_meta = _plan_memory(
+            profile, goal, memory.long_term
+        )
+        if pack_meta:
+            # Metadata only. The pack body is ephemeral prompt context.
+            tracer.event("memory_pack", **pack_meta)
         if not resumed:
-            profile_text = _profile_text(profile, goal)
             if settings.agent_context_builder_enabled:
                 from app.agent.context_parts import build_planner_parts
                 from app.agent.planner import PLANNER_SYSTEM
@@ -157,18 +194,20 @@ class XHSAgent:
                     tools_full=self.planner._tools_text(),
                     tools_concise=self.planner._tools_concise(),
                     system_text=PLANNER_SYSTEM,
+                    store=getattr(memory.long_term, "store", None),
                 )
-                knowledge_text = next((p.text for p in parts if p.key == "knowledge"), "")
+                part_knowledge = next((p.text for p in parts if p.key == "knowledge"), "")
+                if part_knowledge:
+                    knowledge_text = part_knowledge
                 plan = await self.planner.plan(
                     goal,
-                    profile_text,
+                    execute_profile,
                     context_parts=parts,
                     tracer=tracer,
                     run_id=tracer.run_id,
                 )
             else:
-                knowledge_text = _knowledge_context(goal)
-                plan = await self.planner.plan(goal, profile_text + knowledge_text)
+                plan = await self.planner.plan(goal, planner_text)
             if knowledge_text:
                 tracer.event("knowledge_context", chars=len(knowledge_text))
             # M2 结构化强制(Read-Gate 闭环): prompt 措辞对抗已证不可靠(两轮实战
@@ -182,7 +221,7 @@ class XHSAgent:
             tracer.event("plan", steps=[s.action for s in plan.steps])
         executor.base_usage = base_usage
         executor.profile_dict = profile
-        plan = await executor.execute(goal, _profile_text(profile, goal), plan, memory)
+        plan = await executor.execute(goal, execute_profile, plan, memory)
 
         if plan.is_complete and checkpointer:
             checkpointer.clear(tracer.run_id)
@@ -193,7 +232,7 @@ class XHSAgent:
             strategy=settings.agent_collect_strategy,
             top_n=settings.agent_top_n,
         )
-        _remember_lesson(memory, goal, plan, outputs)
+        _remember_lesson(memory, goal, plan, outputs, run_id=tracer.run_id)
         # R3 (memory-rag-selection): run 产物自动入 RAG 知识库 — 分析报告 +
         # 生成文案 + 爬取笔记(工具侧已落盘, 由 _persist_crawl_result 完成)。
         # mock 后端(测试/离线演示)不写入真实知识库; 失败不致命。
@@ -262,6 +301,76 @@ def _budget_stop_reason(tracer) -> str:
         if e.get("kind") == "budget_stop":
             return e.get("reason", "budget exceeded")
     return ""
+
+
+def _bind_run_store(memory: AgentMemory):
+    """Point memory tools at this run's SQLite store. Failure leaves the run usable."""
+    try:
+        from app.agent.memory_store import bind_store
+
+        return bind_store(memory.long_term.store)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("memory store bind skipped: %s", exc)
+        return None
+
+
+def _reset_run_store(token) -> None:
+    if token is None:
+        return
+    try:
+        from app.agent.memory_store import reset_store
+
+        reset_store(token)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("memory store reset skipped: %s", exc)
+
+
+def _plan_memory(profile: dict[str, Any], goal: str, long_term) -> tuple[str, str, str, dict[str, Any]]:
+    """Return ``(planner_prompt, execute_profile, knowledge_text, pack_meta)``.
+
+    The pack is ephemeral. ``pack_meta`` never includes the pack body, and the
+    execute/reflector profile is the pack without the knowledge lane so a
+    document digest cannot crowd out veto lines or land in a checkpoint.
+    """
+    knowledge = _knowledge_context(goal)
+    legacy = _profile_text(profile, goal)
+    meta: dict[str, Any] = {
+        "enabled": bool(settings.agent_memory_pack_enabled),
+        "unavailable": False,
+        "revision": 0,
+        "chars": 0,
+        "dropped": 0,
+    }
+    if not settings.agent_memory_pack_enabled:
+        meta["chars"] = len(legacy)
+        return legacy + (knowledge or ""), legacy, knowledge, meta
+    try:
+        from app.agent.memory_pack import build_pack
+
+        pack = build_pack(
+            goal,
+            store=long_term.store,
+            profile=profile,
+            knowledge_text="",
+        )
+        meta.update(
+            unavailable=bool(pack.unavailable),
+            revision=int(pack.revision),
+            chars=len(pack.text),
+            dropped=len(pack.dropped),
+        )
+        return pack.text + (knowledge or ""), pack.text, knowledge, meta
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("memory pack failed: %s", exc)
+        meta["unavailable"] = True
+        banner = (
+            '<memory-context user_id="local" ephemeral="true" unavailable="true">\n'
+            "Memory pack unavailable this turn. Do not claim you remember nothing; "
+            "the profile below still applies.\n"
+            f"{legacy}\n</memory-context>"
+        )
+        meta["chars"] = len(banner)
+        return banner + (knowledge or ""), banner, knowledge, meta
 
 
 def _query_variants(goal: str) -> list[str]:
@@ -474,7 +583,13 @@ def _ingest_outputs_to_knowledge(goal: str, outputs: dict) -> None:
             )
 
 
-def _remember_lesson(memory: AgentMemory, goal: str, plan: Plan, outputs: dict) -> None:
+def _remember_lesson(
+    memory: AgentMemory,
+    goal: str,
+    plan: Plan,
+    outputs: dict,
+    run_id: str = "",
+) -> None:
     """Persist what this run learned so future plans can reuse successful patterns.
 
     plan 12.1: dedup lessons by a normalized goal signature, split long-term memory
@@ -517,6 +632,72 @@ def _remember_lesson(memory: AgentMemory, goal: str, plan: Plan, outputs: dict) 
 
     # 单次落盘:episodic/lessons/procedural 一批写,不再每键一次全量重写。
     memory.long_term.set_many(writes)
+    _index_episodic_run(memory, goal, plan, outputs, run_id, episodic)
+
+
+def _episode_assets(outputs: dict) -> tuple[list[str], list[str], str]:
+    """Titles, topics, and a short snippet from this run's content assets."""
+    titles: list[str] = []
+    topics: list[str] = []
+    snippet = ""
+    for item in outputs.get("results") or []:
+        if isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            if title:
+                titles.append(title[:120])
+            topic = item.get("topic") or item.get("topic_title")
+            if topic:
+                topics.append(str(topic)[:80])
+            body = str(item.get("body") or item.get("content") or "")
+            if body and not snippet:
+                snippet = body[:180]
+        elif isinstance(item, str) and item.strip() and not snippet:
+            snippet = item.strip()[:180]
+    for key in ("top_keywords", "top_tags", "title_patterns"):
+        for value in outputs.get(key) or []:
+            if isinstance(value, str) and value.strip():
+                topics.append(value.strip()[:40])
+    deduped_topics: list[str] = []
+    for topic in topics:
+        if topic not in deduped_topics:
+            deduped_topics.append(topic)
+    return titles[:12], deduped_topics[:16], snippet
+
+
+def _index_episodic_run(
+    memory: AgentMemory,
+    goal: str,
+    plan: Plan,
+    outputs: dict,
+    run_id: str,
+    episodic: list[dict[str, Any]],
+) -> None:
+    """Index this run's goal plus any titles/topics. Failure does not fail the run."""
+    try:
+        signature = _goal_signature(goal)
+        stored = next(
+            (
+                entry
+                for entry in reversed(episodic)
+                if _goal_signature(entry.get("goal", "")) == signature
+            ),
+            None,
+        )
+        titles, topics, snippet = _episode_assets(outputs)
+        memory.long_term.store.upsert_episodic(
+            run_id=run_id or "",
+            goal=goal,
+            signature=signature,
+            status="ok" if plan.is_complete else "incomplete",
+            titles=titles,
+            topics=topics,
+            snippet=snippet,
+            result_count=len(outputs.get("results") or []),
+            quality=outputs.get("quality_report"),
+            hits=int((stored or {}).get("hits") or 1),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("episodic index skipped: %s", exc)
 
 
 def _profile_sections(profile: dict[str, Any], goal: str = "") -> dict[str, str]:

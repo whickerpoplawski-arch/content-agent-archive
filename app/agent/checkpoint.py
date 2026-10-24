@@ -36,13 +36,17 @@ class StepCheckpointer:
         memory_meta: Optional[dict[str, Any]] = None,
     ) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "run_id": run_id,
-            "plan": plan.model_dump(mode="json"),
-            "memory": {"steps": memory_steps, "meta": memory_meta or {}},
-            "usage": usage,
-            "updated_at": _now(),
-        }
+        from app.agent.memory_pack import strip_ephemeral_pack
+
+        payload = strip_ephemeral_pack(
+            {
+                "run_id": run_id,
+                "plan": plan.model_dump(mode="json"),
+                "memory": {"steps": memory_steps, "meta": memory_meta or {}},
+                "usage": usage,
+                "updated_at": _now(),
+            }
+        )
         path = self._path(run_id)
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(

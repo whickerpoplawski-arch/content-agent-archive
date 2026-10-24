@@ -612,4 +612,13 @@ def build_default_registry(
         LoadSkillParams,
         overrides.get("load_skill", _load_skill),
     ))
+    from app.agent.memory_tools import iter_memory_tools
+
+    for name, description, schema, handler in iter_memory_tools():
+        registry.register(Tool(
+            name,
+            description,
+            schema,
+            overrides.get(name, handler),
+        ))
     return registry

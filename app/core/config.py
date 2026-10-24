@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     # Context engineering (feature-flagged). Builder defaults off so the legacy
     # profile-string prompt stays the production path until explicitly enabled.
     agent_context_builder_enabled: bool = False
+    # Ephemeral SQLite memory pack. On by default: planner context comes from
+    # learnings + episodic_runs, not the 20-row JSON window. Pack text is not
+    # persisted as user speech.
+    agent_memory_pack_enabled: bool = True
+    agent_memory_pack_budget_tokens: int = 1200
+    agent_memory_pack_general_tokens: int = 400
+    agent_memory_pack_situational_tokens: int = 400
+    agent_memory_pack_episodic_tokens: int = 300
+    agent_memory_user_id: str = "local"
     agent_context_budget_planner: int = 6000
     agent_context_hard_planner: int = 7500
     agent_context_budget_reflector: int = 4000
@@ -140,6 +149,7 @@ class Settings(BaseSettings):
         "debug",
         "crawl_headless",
         "agent_context_builder_enabled",
+        "agent_memory_pack_enabled",
         "agent_artifact_offload_enabled",
         "agent_obs_compress_enabled",
         "agent_skills_enabled",

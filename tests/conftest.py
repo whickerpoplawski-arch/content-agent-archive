@@ -14,10 +14,14 @@ import pytest
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_profile(tmp_path_factory):
     from app.agent.memory import LongTermMemory
+    from app.agent import memory_store
 
-    tmp = tmp_path_factory.mktemp("profile") / "profile.json"
+    tmp_dir = tmp_path_factory.mktemp("profile")
+    tmp = tmp_dir / "profile.json"
     # LongTermMemory() 的默认 path 在类定义时绑定 PROFILE_FILE,改 __defaults__ 兜住。
     defaults = list(LongTermMemory.__init__.__defaults__)
     defaults[0] = tmp
     LongTermMemory.__init__.__defaults__ = tuple(defaults)
+    # 工具/HTTP 未绑 run store 时也落到这份临时库，避免写到 data/agent/memory.db。
+    memory_store.DEFAULT_DB_PATH = tmp_dir / "memory.db"
     yield tmp
